@@ -1,0 +1,4 @@
+__pycache__/
+best_models/*.pkl
+.venv/
+testONNXexport.py
