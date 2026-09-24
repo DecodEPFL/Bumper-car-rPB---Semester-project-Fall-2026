@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+import os
 import numpy as np
 import torch
 import torch.nn as nn
 from plants.bumpercar.utils import normalize_angle
 from .parameters import CarParams as params
+
+DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_kinematic_mlp.pth")
 
 import torch
 import torch.nn as nn
@@ -162,7 +165,7 @@ class BumpercarSystem(nn.Module):
         u_init=None,
         n_agents=2,
         dt=0.04,
-        model_path="plants/bumpercar/model_kinematic_mlp.pth",
+        model_path=DEFAULT_MODEL_PATH,
     ):
         super().__init__()
 
@@ -340,7 +343,7 @@ class MLPDynamicsModel(nn.Module):
     def __init__(self,
                  initial_state,
                  params,
-                 model_path = "plants/bumpercar/model_kinematic_mlp.pth",
+                 model_path = DEFAULT_MODEL_PATH,
                  input_dim = 2,
                  state_dim = 4,
                  output_dim = 3,

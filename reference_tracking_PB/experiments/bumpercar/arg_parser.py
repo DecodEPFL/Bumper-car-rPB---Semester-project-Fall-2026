@@ -3,7 +3,7 @@ import argparse, math
 
 # argument parser
 def argument_parser():
-    parser = argparse.ArgumentParser(description="Robots minimal experiment.")
+    parser = argparse.ArgumentParser(description="Bumpercar rPB training.")
 
     # experiment
     parser.add_argument('--random-seed', type=int, default=5, help='Random seed. Default is 5.')
@@ -15,10 +15,6 @@ def argument_parser():
     parser.add_argument('--n-agents', type=int, default=2, help='Number of agents. Default is 2.')
     parser.add_argument('--num-rollouts', type=int, default=30, help='Number of rollouts in the training data. Default is 30.')
     parser.add_argument('--std-init-plant', type=float, default=0.2, help='std of the plant initial conditions. Default is 0.2.')
-
-    # plant
-    parser.add_argument('--spring-const', type=float, default=1.0 , help='Spring constant. Default is 1.0.')
-    parser.add_argument('--linearize-plant', type=bool, default=False, help='Linearize plant or not. Default is False.')
 
     # controller
     parser.add_argument('--cont-init-std', type=float, default=0.1, help='Initialization std for controller params. Default is 0.1.')
@@ -84,8 +80,6 @@ def argument_parser():
 def print_args(args):
     msg = '\n[INFO] Dataset: n_agents: %i' % args.n_agents + ' -- num_rollouts: %i' % args.num_rollouts
     msg += ' -- std_ini: %.2f' % args.std_init_plant + ' -- time horizon: %i' % args.horizon
-    
-    msg += '\n[INFO] Plant: spring constant: %.2f' % args.spring_const + ' -- use linearized plant: ' + str(args.linearize_plant)
 
     msg += '\n[INFO] Controller: dimension of the internal state: %i' % args.dim_internal
     msg += ' -- dim_nl: %i' % args.dim_nl + ' -- cont_init_std: %.2f'% args.cont_init_std

@@ -12,25 +12,25 @@ from experiment_params import getCarFinalParams, getCarInitParams, getLossParams
 from controllers.MLP import ZeroController
 from config import device
 from arg_parser import argument_parser, print_args
-from plants import RobotsSystem, RobotsDataset, BumpercarDataset, BumpercarSystem, car_params
+from plants import BumpercarDataset, BumpercarSystem, car_params
 from utils.plot_functions import *
 from controllers import PerfBoostController
-from loss_functions import RobotsLoss, BumpercarLoss
+from loss_functions import BumpercarLoss
 from utils.assistive_functions import WrapLogger
 
 
 def main():
     """
-    Train and evaluate a performance boosting controller on the robots reference-tracking task.
+    Train and evaluate a performance boosting controller on the two-car bumpercar reference-tracking task.
 
     This script is intentionally self-contained: it generates synthetic rollouts/references,
     trains by backpropagating through closed-loop rollouts, and writes all artifacts (logs, plots,
-    checkpoints) under `experiments/robots/saved_results/`.
+    checkpoints) under `experiments/bumpercar/saved_results/` (or `--save-path`).
     """
     # ----- SET UP LOGGER / OUTPUT FOLDERS -----
     args = argument_parser()
     now = datetime.now().strftime("%m_%d_%H_%M_%S")
-    save_path = args.save_path or os.path.join(BASE_DIR, 'experiments', 'robots', 'saved_results')
+    save_path = args.save_path or os.path.join(BASE_DIR, 'experiments', 'bumpercar', 'saved_results')
 
     save_folder = os.path.join(save_path, 'perf_boost_' + now)
     save_folder_gif = os.path.join(save_folder, 'gifs')
@@ -175,39 +175,28 @@ def main():
     optimizer = torch.optim.Adam(ctl.parameters(), lr=args.lr)
  
 # ------------ 6. Training ------------
-# plot PID without untrained rPB
-# ------------ PID-only verification ------------
-    logger.info("Plotting closed-loop trajectories with PID only...")
-
-# plot closed-loop trajectories before training the controller
-    logger.info('Plotting closed-loop trajectories before training the controller...')
-    x_log, _, u_log = sys.rollout(ctl, plot_data)
-
-
-    nx = 7 * n_agents
-    
-    data_verif = torch.zeros(3, args.horizon + 200, 2 * nx)
-    data_verif[:, 0:1, :nx] = dataset.x0.view(1, 1, -1)
-    data_verif[0:1, :, nx:] = x0_bumpercar.view(1, 1, -1)
-    data_verif[1:2, :, nx:] = x0_bumpercar.view(1, 1, -1)
-    data_verif[2:3, :, nx:] = x0_bumpercar.view(1, 1, -1)
-    data_verif = data_verif.to(device)
+# baseline: P-controller only (no rPB correction), from the nominal start to the nominal goal
+    logger.info("Plotting closed-loop trajectory with the P-controller only...")
+    data_pid = torch.zeros(1, args.horizon + 200, 2 * nx, device=device)
+    data_pid[:, 0, :nx] = dataset.x0.to(device)
+    data_pid[:, :, nx:] = x_final_bumpercar.to(device)
     pid_only_ctl = ZeroController(ref_dim=2 * n_agents).to(device)
-    x_verif, _, u_verif = sys.rollout(pid_only_ctl, data_verif)
-    
-    plot_trajectories(
-        x_verif[0, :, :],
-        xbar=x0_bumpercar,
-        n_agents=sys.n_agents,
-        save_folder=save_folder,
-        filename='Only PID.pdf',
-        text="Not ONLY PID",
-        T=t_ext,
-        obstacle_centers=loss_fn.obstacle_centers,
-        obstacle_covs=loss_fn.obstacle_covs,
+    with torch.no_grad():
+        x_pid, _, _ = sys.rollout(pid_only_ctl, data_pid)
+    plot_closed_loop(
+        x_pid[0], data_pid[0, 0, nx:], save_folder, 'CL_P_only.pdf',
+        'P-controller only (no rPB)', loss_fn, data_pid.shape[1],
     )
-    
- 
+
+# closed-loop trajectory before training the controller
+    logger.info('Plotting closed-loop trajectory before training the controller...')
+    with torch.no_grad():
+        x_log, _, u_log = sys.rollout(ctl, plot_data[:1])
+    plot_closed_loop(
+        x_log[0], plot_data[0, 0, nx:], save_folder, 'CL_untrained.pdf',
+        'rPB - untrained controller', loss_fn, t_ext,
+    )
+
     logger.info('\n------------ Begin training ------------')
     best_valid_loss = 1e6
     t = time.time()
@@ -316,138 +305,43 @@ def main():
     logger.info(msg)
 
 
-#     # plot closed-loop trajectories using the trained controller
-#     logger.info('Plotting closed-loop trajectories using the trained controller...')
-#     x_log, _, u_log = sys.rollout(ctl, plot_data)
-#     plot_trajectories(
-#         x_log[0, :, :],  # remove extra dim due to batching
-#         xbar=plot_data[0, min(5, plot_data.shape[1] - 1), nx:],
-#         n_agents=sys.n_agents,
-#         save_folder=save_folder,
-#         filename='CL_trained.pdf',
-#         text="CL - trained controller",
-#         T=t_ext,
-#         obstacle_centers=loss_fn.obstacle_centers,
-#         obstacle_covs=loss_fn.obstacle_covs,
-#     )
-
-#     x_verif, _, u_verif = sys.rollout(ctl, data_verif)
-#     v_verif = sys.v_log
-#     plot_trajectories(
-#         x_verif[0, :, :],  # remove extra dim due to batching
-#         xbar=xbar_train,
-#         n_agents=sys.n_agents,
-#         save_folder=save_folder,
-#         filename='CL_diag_trained.pdf',
-#         text="rPB - trained controller",
-#         T=t_ext,
-#         obstacle_centers=loss_fn.obstacle_centers,
-#         obstacle_covs=loss_fn.obstacle_covs,
-#     )
-
-#     plot_trajectories(
-#         x_verif[1, :, :],  # remove extra dim due to batching
-#         xbar=xbar_verif2,
-#         n_agents=sys.n_agents,
-#         save_folder=save_folder,
-#         filename='CL_direct_trained.pdf',
-#         text="rPB - trained controller",
-#         T=t_ext,
-#         obstacle_centers=loss_fn.obstacle_centers,
-#         obstacle_covs=loss_fn.obstacle_covs,
-#     )
-
-#     plot_trajectories(
-#         x_verif[2, :, :],  # remove extra dim due to batching
-#         xbar=xbar_verif3,
-#         n_agents=sys.n_agents,
-#         save_folder=save_folder,
-#         filename='CL_center_trained.pdf',
-#         text="CL - trained controller",
-#         T=t_ext,
-#         obstacle_centers=loss_fn.obstacle_centers,
-#         obstacle_covs=loss_fn.obstacle_covs,
-#     )
+# plot closed-loop trajectory and controller output using the trained controller
+    logger.info('Plotting closed-loop trajectory using the trained controller...')
+    with torch.no_grad():
+        x_log, _, u_log = sys.rollout(ctl, plot_data[:1])
+    plot_closed_loop(
+        x_log[0], plot_data[0, 0, nx:], save_folder, 'CL_trained.pdf',
+        'rPB - trained controller', loss_fn, t_ext,
+    )
+    plot_dxref_over_time(u_log[0], sys.dt, n_agents, save_folder, 'U_over_time.pdf')
 
 
-
-# #### Plot the evolution of the reference over time for the diagonal scenario ####
-#     x_ref_evol = torch.zeros(1, args.horizon + 200, 14)
-#     x_ref_evol[:, :, 0:2] = u_verif[0:1, :, 0:2]
-#     x_ref_evol[:, :, 4:6] = u_verif[0:1, :, 2:4]
-#     x_ref_evol = x_ref_evol + xbar_train
-
-
-
-#     plot_trajectories(
-#         x_ref_evol[0, :, :],  # remove extra dim due to batching
-#         xbar=xbar_train,
-#         n_agents=sys.n_agents,
-#         save_folder=save_folder,
-#         filename='CL_xbar_evolution.pdf',
-#         text="CL - evolution of the reference",
-#         T=t_ext,
-#         dots=True,
-#         obstacle_centers=loss_fn.obstacle_centers,
-#         obstacle_covs=loss_fn.obstacle_covs,
-#     )
+def plot_closed_loop(x, xbar, save_folder, filename, text, loss_fn, T):
+    """Plot one closed-loop rollout x [T, 7*n_agents] with goal xbar [7*n_agents] and the obstacles."""
+    plot_trajectories(
+        x, xbar=xbar, n_agents=loss_fn.n_agents, save_folder=save_folder,
+        filename=filename, text=text, T=T,
+        obstacle_centers=loss_fn.obstacle_centers, obstacle_covs=loss_fn.obstacle_covs,
+    )
 
 
-# # Create a figure with a 2x2 grid of subplots
-#     fig, axs = plt.subplots(2, 1, figsize=(10, 7))
-#     axs[0].plot(np.array(range(u_verif.shape[1])), u_verif[2, :, 0], label="dX")
-#     axs[0].plot(np.array(range(u_verif.shape[1])), u_verif[2, :, 1], label="dY")
-#     axs[0].set_title("Robot 1")
-#     axs[0].set_xlabel("Time (s)")
-#     axs[0].set_ylabel("Delta ref")
-#     axs[0].legend()
-#     axs[0].grid()
-
-#     axs[1].plot(np.array(range(u_verif.shape[1])), u_verif[2, :, 2], label="dX")
-#     axs[1].plot(np.array(range(u_verif.shape[1])), u_verif[2, :, 3], label="dY")
-#     axs[1].set_title("Robot 2")
-#     axs[1].set_xlabel("Time (s)")
-#     axs[1].set_ylabel("Delta ref")
-#     axs[1].legend()
-#     axs[1].grid()
-
-#     # Adjust layout to prevent overlap
-#     plt.tight_layout()
-#     plt.subplots_adjust(top=0.9)  # Adjust the top space to make room for the suptitle
-
-#     plt.suptitle(
-#         'Performance boosting offset to the reference over time \n for the diagonal scenario',
-#         fontsize=13,
-#     )
-#     plt.savefig(os.path.join(save_folder, "U_over_time.pdf"))
-#     plt.close()
-
-
-# # Create a figure with a 2x2 grid of subplots
-#     fig, axs = plt.subplots(2, 1, figsize=(10, 7))
-#     axs[0].plot(np.array(range(u_verif.shape[1])), v_verif[0, :, 0], label="v_X")
-#     axs[0].plot(np.array(range(u_verif.shape[1])), v_verif[0, :, 1], label="v_Y")
-#     axs[0].set_title("Robot 1")
-#     axs[0].set_xlabel("Time (s)")
-#     axs[0].set_ylabel("v")
-#     axs[0].legend()
-#     axs[0].grid()
-
-#     axs[1].plot(np.array(range(u_verif.shape[1])), v_verif[0, :, 2], label="v_X")
-#     axs[1].plot(np.array(range(u_verif.shape[1])), v_verif[0, :, 3], label="v_Y")
-#     axs[1].set_title("Robot 2")
-#     axs[1].set_xlabel("Time (s)")
-#     axs[1].set_ylabel("v")
-#     axs[1].legend()
-#     axs[1].grid()
-
-#     # Adjust layout to prevent overlap
-#     plt.tight_layout()
-#     plt.subplots_adjust(top=0.9)  # Adjust the top space to make room for the suptitle
-
-#     plt.suptitle('Integral variable over time \n for the diagonal scenario', fontsize=13)
-#     plt.savefig(os.path.join(save_folder, "V_over_time.pdf"))
-#     plt.close()
+def plot_dxref_over_time(u, dt, n_agents, save_folder, filename):
+    """Plot the rPB output dxref = (dX, dY) of each car over time for one rollout u [T, 2*n_agents]."""
+    u = u.detach().cpu()
+    t = torch.arange(u.shape[0]) * dt
+    fig, axs = plt.subplots(n_agents, 1, figsize=(10, 3.5 * n_agents), sharex=True)
+    for i in range(n_agents):
+        axs[i].plot(t, u[:, 2 * i], label="dX")
+        axs[i].plot(t, u[:, 2 * i + 1], label="dY")
+        axs[i].set_title(f"Car {i + 1}")
+        axs[i].set_ylabel("Reference offset [m]")
+        axs[i].legend()
+        axs[i].grid()
+    axs[-1].set_xlabel("Time [s]")
+    fig.suptitle("rPB offset to the reference over time (trained controller)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_folder, filename))
+    plt.close(fig)
 
 
 if __name__ == "__main__":

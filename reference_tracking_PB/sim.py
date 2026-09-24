@@ -22,7 +22,7 @@ from plants.bumpercar.bumpercar_dataset import BumpercarDataset
 
 
 # Add your trained pRB checkpoint here. Prefer a checkpoint with MLP weights, e.g.
-TRAINED_PBR_MODEL_PATH="experiments/bumpercar/trained_pRB/rPB_best.pt"
+TRAINED_PBR_MODEL_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/trained_pRB/rPB_best.pt")
 
 EVALUATE_MODEL = True
 EVAL_HORIZON = 500
@@ -35,12 +35,12 @@ SIM_DATA_SPLIT = "train"
 SIM_SAMPLE_INDEX = 12
 SIM_RANDOM_SEED = EVAL_RANDOM_SEED
 OBSTACLE_RADIUS = 1.5
-REPORT_FIGURE_PATH = "experiments/bumpercar/report_trajectory.svg"
-REPORT_COLLISION_FIGURE_PATH = "experiments/bumpercar/report_collision.svg"
-REPORT_INIT_FIGURE_PATH = "experiments/bumpercar/report_setup.svg"
-REPORT_SNAPSHOT_FIGURE_PATH = "experiments/bumpercar/report_snapshots.svg"
-TRAJECTORY_GIF_PATH = "experiments/bumpercar/trajectory.gif"
-ROLLOUT_METRICS_PATH = "experiments/bumpercar/rollout_metrics.csv"
+REPORT_FIGURE_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/report_trajectory.svg")
+REPORT_COLLISION_FIGURE_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/report_collision.svg")
+REPORT_INIT_FIGURE_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/report_setup.svg")
+REPORT_SNAPSHOT_FIGURE_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/report_snapshots.svg")
+TRAJECTORY_GIF_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/trajectory.gif")
+ROLLOUT_METRICS_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/rollout_metrics.csv")
 REPORT_FINAL_RADIUS = 1.0
 
 DT = 0.04

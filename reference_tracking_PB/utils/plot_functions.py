@@ -14,22 +14,41 @@ def plot_trajectories(
 
     # fig = plt.figure(f)
     fig, ax = plt.subplots(figsize=(f,f))
+
+    # axis limits: fit the trajectories, the goals and the obstacles (+-2 std), plus a margin
+    xs = [x[:, 7*i].detach().cpu().numpy() for i in range(n_agents)] + [xbar[7*i].detach().cpu().numpy().reshape(1) for i in range(n_agents)]
+    ys = [x[:, 7*i+1].detach().cpu().numpy() for i in range(n_agents)] + [xbar[7*i+1].detach().cpu().numpy().reshape(1) for i in range(n_agents)]
+    if obstacle_centers is not None:
+        for k, center in enumerate(obstacle_centers):
+            c = center.detach().cpu().numpy().flatten()
+            r = 2 * np.sqrt(obstacle_covs[k].detach().cpu().numpy().flatten()) if obstacle_covs is not None else np.zeros(2)
+            xs.append(np.array([c[0] - r[0], c[0] + r[0]]))
+            ys.append(np.array([c[1] - r[1], c[1] + r[1]]))
+    xs, ys = np.concatenate(xs), np.concatenate(ys)
+    margin = 0.5
+    x_lim = (xs.min() - margin, xs.max() + margin)
+    y_lim = (ys.min() - margin, ys.max() + margin)
+
     # plot obstacles
     if not obstacle_covs is None:
         assert not obstacle_centers is None
-        yy, xx = np.meshgrid(np.linspace(-3, 7, 100), np.linspace(-3, 7, 100))
-        zz = xx * 0
+        xx, yy = np.meshgrid(np.linspace(*x_lim, 150), np.linspace(*y_lim, 150))
+        grid = np.stack([xx.ravel(), yy.ravel()], axis=-1)
+        zz = np.zeros(xx.size)
         for center, cov in zip(obstacle_centers, obstacle_covs):
             distr = multivariate_normal(
                 cov=torch.diag(cov.flatten()).detach().clone().cpu().numpy(),
                 mean=center.detach().clone().cpu().numpy().flatten()
             )
-            for i in range(xx.shape[0]):
-                for j in range(xx.shape[1]):
-                    zz[i, j] += distr.pdf([xx[i, j], yy[i, j]])
+            zz += distr.pdf(grid)
+        zz = zz.reshape(xx.shape)
         z_min, z_max = np.abs(zz).min(), np.abs(zz).max()
 
         ax.pcolormesh(xx, yy, zz, cmap='Greys', vmin=z_min, vmax=z_max, shading='gouraud')
+
+    ax.set_xlim(*x_lim)
+    ax.set_ylim(*y_lim)
+    ax.set_aspect('equal', adjustable='box')
 
     ax.set_title(text)
     colors = ['tab:blue', 'tab:orange']

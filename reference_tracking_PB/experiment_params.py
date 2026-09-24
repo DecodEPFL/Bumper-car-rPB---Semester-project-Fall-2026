@@ -1,6 +1,6 @@
 import torch
 
-from experiments.robots.arg_parser import argument_parser
+from experiments.bumpercar.arg_parser import argument_parser
 
 STD_INIT_XY = 0.2
 STD_INIT_THETA = 10/360*2*torch.pi
