@@ -12,13 +12,14 @@ from matplotlib.widgets import Slider
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(1, BASE_DIR)
 
-from experiment_params import getCarFinalParams, getCarInitParams, getLossParams
+from experiment_params import getCarFinalParams, getCarInitParams, getLossParams, n_agents as N_AGENTS
 from config import device
 from controllers import PerfBoostController
 from controllers.MLP import ZeroController
 from loss_functions import BumpercarLoss
 from plants import BumpercarSystem, car_params
 from plants.bumpercar.bumpercar_dataset import BumpercarDataset
+from utils.plot_functions import agent_color
 
 
 # Add your trained pRB checkpoint here. Prefer a checkpoint with MLP weights, e.g.
@@ -47,6 +48,14 @@ DT = 0.04
 
 
 
+def closest_pair_distance(positions):
+    """positions [..., n_agents, 2] -> distance of the closest pair of cars [...]."""
+    n = positions.shape[-2]
+    distances = torch.cdist(positions, positions)                                  # [..., n, n]
+    off_diagonal = ~torch.eye(n, dtype=torch.bool, device=positions.device)
+    return distances[..., off_diagonal].min(dim=-1).values
+
+
 def make_generated_sample_data(horizon, sample_index=0, random_seed=11, split="train"):
     train_data, test_data = make_eval_data(
         horizon=horizon,
@@ -69,7 +78,7 @@ def make_generated_sample_data(horizon, sample_index=0, random_seed=11, split="t
     return data.to(device), xbar.to(device)
 
 
-def make_crossing_data(horizon, n_agents=2, ):
+def make_crossing_data(horizon, n_agents=N_AGENTS):
     nx = 7 * n_agents
     data = torch.zeros(1, horizon, 2 * nx)
 
@@ -95,7 +104,7 @@ def make_eval_data(horizon, num_rollouts, num_test_rollouts, random_seed):
         y_final_limit=y_final_limit,
         final_car_min_dist=final_car_min_dist,
         std_init_theta = std_init_theta,
-        n_agents=2,
+        n_agents=N_AGENTS,
     )
     train_data, test_data = dataset.get_data(
         num_train_samples=num_rollouts,
@@ -104,7 +113,7 @@ def make_eval_data(horizon, num_rollouts, num_test_rollouts, random_seed):
     return train_data.to(device), test_data.to(device)
 
 
-def make_loss_fn(train_data, n_agents=2):
+def make_loss_fn(train_data, n_agents=N_AGENTS):
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)    
     Q, Q_final, Qs, alpha_col, alpha_obst, alpha_u, position_deadzone, steady_state_velocity_radius, min_dist = getLossParams(device)
     
@@ -113,7 +122,7 @@ def make_loss_fn(train_data, n_agents=2):
         Q_final=Q_final,
         Qs=Qs,
         alpha_u=alpha_u,
-        xbar=train_data[0, :, 14:],
+        xbar=train_data[0, :, 7 * n_agents:],
         loss_bound=None,
         sat_bound=None,
         alpha_col=alpha_col,
@@ -127,7 +136,7 @@ def make_loss_fn(train_data, n_agents=2):
     )
 
 
-def obstacle_collision_indices(x_log, obstacle_centers, radius=OBSTACLE_RADIUS, n_agents=2):
+def obstacle_collision_indices(x_log, obstacle_centers, radius=OBSTACLE_RADIUS, n_agents=N_AGENTS):
     collision_indices = set()
     radius_sq = radius ** 2
 
@@ -192,6 +201,7 @@ def evaluate_controller():
         params=car_params,
         x_init=None,
         u_init=None,
+        n_agents=N_AGENTS,
         dt=DT,
     ).to(device)
     
@@ -238,6 +248,7 @@ def simulate(horizon=400, use_generated_sample=SIM_USE_GENERATED_SAMPLE, sample_
         params=car_params,
         x_init=None,
         u_init=None,
+        n_agents=N_AGENTS,
         dt = DT,
     ).to(device)
 
@@ -285,6 +296,7 @@ def evaluate_rollout_metrics(
         params=car_params,
         x_init=None,
         u_init=None,
+        n_agents=N_AGENTS,
         dt=DT,
     ).to(device)
 
@@ -323,7 +335,7 @@ def evaluate_rollout_metrics(
 
     rollout_horizon = x_log.shape[1]
     positions = x_log[:, :, pos_idx].reshape(num_runs, rollout_horizon, n_agents, 2)
-    car_distance = torch.linalg.norm(positions[:, :, 0, :] - positions[:, :, 1, :], dim=-1)
+    car_distance = closest_pair_distance(positions)                                  # [runs, T]
     closest_car_distance = car_distance.min(dim=1).values
 
     centers = torch.stack([
@@ -518,8 +530,8 @@ def draw_sample_regions(ax, colors):
 def save_report_figure(path=REPORT_FIGURE_PATH):
     x_log, xbar, dx_log, _ = simulate()
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
-    n_agents = 2
-    colors = ["tab:blue", "tab:orange"]
+    n_agents = N_AGENTS
+    colors = [agent_color(i) for i in range(n_agents)]
 
     fig, ax = plt.subplots(figsize=(6.2, 7.0))
     ax.set_aspect("equal", adjustable="box")
@@ -571,8 +583,8 @@ def save_report_figure(path=REPORT_FIGURE_PATH):
 def save_snapshot_report_figure(path=REPORT_SNAPSHOT_FIGURE_PATH):
     x_log, xbar, dx_log, _ = simulate()
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
-    n_agents = 2
-    colors = ["tab:blue", "tab:orange"]
+    n_agents = N_AGENTS
+    colors = [agent_color(i) for i in range(n_agents)]
     snapshot_idxs = [0, 30, 60, 120, 399]
     snapshot_labels = ["1", "2", "3", "4", "5"]
     snapshot_alphas = [0.30, 0.50, 0.65, 0.8, 0.9]
@@ -651,8 +663,8 @@ def save_collision_report_figure(path=REPORT_COLLISION_FIGURE_PATH):
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
     _, _, _, _, _, _, _, _, min_dist = getLossParams(device)
     x0_bumpercar, x_final, _, _, _, _ = getCarInitParams(device)
-    n_agents = 2
-    colors = ["tab:blue", "tab:orange"]
+    n_agents = 2   # illustration of the two-car crossing (first two cars only)
+    colors = [agent_color(i) for i in range(n_agents)]
     safety_radius = min_dist / 2
 
     collision_fractions = torch.tensor([0.425, 0.425])
@@ -735,8 +747,8 @@ def save_collision_report_figure(path=REPORT_COLLISION_FIGURE_PATH):
 
 def save_init_report_figure(path=REPORT_INIT_FIGURE_PATH):
     x0_bumpercar, x_final, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
-    n_agents = 2
-    colors = ["tab:blue", "tab:orange"]
+    n_agents = N_AGENTS
+    colors = [agent_color(i) for i in range(n_agents)]
 
     fig, ax = plt.subplots(figsize=(6.2, 7.0))
     ax.set_aspect("equal", adjustable="box")
@@ -801,8 +813,8 @@ def save_trajectory_gif(path=TRAJECTORY_GIF_PATH, frame_stride=4, fps=20):
     x_log, xbar, dx_log, title = simulate()
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
     _, _, _, _, _, _, _, _, min_dist = getLossParams(device)
-    n_agents = 2
-    colors = ["tab:blue", "tab:orange"]
+    n_agents = N_AGENTS
+    colors = [agent_color(i) for i in range(n_agents)]
     frames = list(range(0, x_log.shape[0], frame_stride))
     if frames[-1] != x_log.shape[0] - 1:
         frames.append(x_log.shape[0] - 1)
@@ -858,7 +870,7 @@ def save_trajectory_gif(path=TRAJECTORY_GIF_PATH, frame_stride=4, fps=20):
             )
             artists.extend([path_lines[i], safety_patches[i], car_patches[i]])
 
-        dist = torch.linalg.norm(x_log[frame, 0:2] - x_log[frame, 7:9]).item()
+        dist = closest_pair_distance(x_log[frame].view(n_agents, 7)[:, :2]).item()
         is_collision = dist < min_dist
         time_text.set_color("tab:red" if is_collision else "black")
         time_text.set_text(f"step {frame}   distance {dist:.2f} m")
@@ -886,8 +898,8 @@ def show_simulation():
     x_log, xbar, dx_log, title = simulate()
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
     _, _, _, _, _, _, _, _, min_dist = getLossParams(device)
-    n_agents = 2
-    colors = ["tab:blue", "tab:orange"]
+    n_agents = N_AGENTS
+    colors = [agent_color(i) for i in range(n_agents)]
 
     fig, ax = plt.subplots(figsize=(7, 7))
     plt.subplots_adjust(bottom=0.16)
@@ -950,7 +962,7 @@ def show_simulation():
                 colors[i],
             )
 
-        dist = torch.linalg.norm(x_log[t, 0:2] - x_log[t, 7:9]).item()
+        dist = closest_pair_distance(x_log[t].view(n_agents, 7)[:, :2]).item()
         is_collision = dist < min_dist
         time_text.set_color("tab:red" if is_collision else "black")
         status = "collision" if is_collision else "clear"

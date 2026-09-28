@@ -72,7 +72,8 @@ class PerfBoostController(nn.Module):
             posdef_tol=posdef_tol, contraction_rate_lb=contraction_rate_lb
         ).to(device)
 
-        self.MLP = MLP(dim_out = self.dim_out)
+        # input: [w_hat (full state), xbar (goal x, y per car)] -> 18 for 2 cars
+        self.MLP = MLP(dim_in=self.dim_in + self.dim_out, dim_out=self.dim_out)
 
         # define the system dynamics without process noise
         self.noiseless_forward = noiseless_forward

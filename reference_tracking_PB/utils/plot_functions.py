@@ -5,6 +5,13 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import imageio
 
+AGENT_COLORS = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple', 'tab:brown']
+
+
+def agent_color(i):
+    return AGENT_COLORS[i % len(AGENT_COLORS)]
+
+
 def plot_trajectories(
     x, xbar, n_agents, save_folder, text="", save=True, filename='', T=100,
     dots=False, circles=False, axis=True, min_dist=1, f=5,
@@ -51,11 +58,10 @@ def plot_trajectories(
     ax.set_aspect('equal', adjustable='box')
 
     ax.set_title(text)
-    colors = ['tab:blue', 'tab:orange']
     for i in range(n_agents):
         ax.plot(
             x[:T+1,7*i].detach().cpu(), x[:T+1,7*i+1].detach().cpu(),
-            color=colors[i%2], linewidth=1
+            color=agent_color(i), linewidth=1
         )
         ax.plot(
             x[T:,7*i].detach().cpu(), x[T:,7*i+1].detach().cpu(),
@@ -64,18 +70,18 @@ def plot_trajectories(
     for i in range(n_agents):
         ax.plot(
             x[0,7*i].detach().cpu(), x[0,7*i+1].detach().cpu(),
-            color=colors[i%2], marker='8'
+            color=agent_color(i), marker='8'
         )
         ax.plot(
             xbar[7*i].detach().cpu(), xbar[7*i+1].detach().cpu(),
-            color=colors[i%2], marker='*', markersize=10
+            color=agent_color(i), marker='*', markersize=10
         )
 
     if dots:
         for i in range(n_agents):
             ax.plot(  
                 x[:T+1,7*i].detach().cpu(), x[:T+1,7*i+1].detach().cpu(),
-                color=colors[i%2], linewidth=1, marker = "x"
+                color=agent_color(i), linewidth=1, marker = "x"
             )
 
     if circles:
@@ -83,7 +89,7 @@ def plot_trajectories(
             r = min_dist/2
             circle = ax.Circle(
                 (x[T, 7*i].detach().cpu(), x[T, 7*i+1].detach().cpu()),
-                r, color=colors[i%2], alpha=0.5, zorder=10
+                r, color=agent_color(i), alpha=0.5, zorder=10
             )
             ax.add_patch(circle)
     ax.axes.xaxis.set_visible(axis)
@@ -165,7 +171,6 @@ def save_trajectory_frames(x, xbar, n_agents, save_folder, T=100, interval=1,f=5
 
 
 
-    colors = ['tab:blue', 'tab:orange']
     for t in range(0, T+1, interval):
         print(f'Saving frame {t}/{T}...')
         fig, ax = plt.subplots(figsize=(f,f))
@@ -188,28 +193,29 @@ def save_trajectory_frames(x, xbar, n_agents, save_folder, T=100, interval=1,f=5
         for i in range(n_agents):
             ax.plot(
                 x[:t+1, 7*i].detach().cpu(), x[:t+1, 7*i+1].detach().cpu(),
-                color=colors[i%2], linewidth=1
+                color=agent_color(i), linewidth=1
             )
             ax.plot(
                 x[t, 7*i].detach().cpu(), x[t, 7*i+1].detach().cpu(),
-                color=colors[i%2], marker='o'
+                color=agent_color(i), marker='o'
             )
             ax.plot(
                 x[0, 7*i].detach().cpu(), x[0, 7*i+1].detach().cpu(),
-                color=colors[i%2], marker='o', markerfacecolor='none'
+                color=agent_color(i), marker='o', markerfacecolor='none'
             )
             r = 0.5
             circle = plt.Circle(
                 (x[t, 7*i].detach().cpu(), x[t, 7*i+1].detach().cpu()),
-                r, color=colors[i%2], alpha=0.5, zorder=10
+                r, color=agent_color(i), alpha=0.5, zorder=10
             )
             ax.add_patch(circle)
             ax.plot(
                 xbar[7*i].detach().cpu(), xbar[7*i+1].detach().cpu(),
-                color=colors[i%2], marker='*', markersize=10
+                color=agent_color(i), marker='*', markersize=10
             )
             
-        dist = torch.sqrt((x[t, 7*0] - x[t, 7*1])**2 + (x[t, 7*0+1] - x[t, 7*1+1])**2)
+        pos = torch.stack([x[t, 7*i:7*i+2] for i in range(n_agents)])
+        dist = torch.cdist(pos, pos)[~torch.eye(n_agents, dtype=torch.bool)].min()   # closest pair
         if dist < 1:
             ax.set_title('Collision', color='red')
              

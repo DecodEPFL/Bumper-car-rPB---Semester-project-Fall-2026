@@ -57,8 +57,10 @@ def main():
 
 
     # ------------ 1. Dataset ------------
-    # [x, y, theta, vf, beta_f, beta_r, delta] for each car    
-    x0_bumpercar, x_final_bumpercar, obstacle_centers, obstacle_covs, car_init_radius, std_init_theta = getCarInitParams(device)
+    # [x, y, theta, vf, beta_f, beta_r, delta] for each car
+    n_agents = args.n_agents
+    nx = 7 * n_agents
+    x0_bumpercar,x_final_bumpercar, obstacle_centers, obstacle_covs, car_init_radius, std_init_theta = getCarInitParams(device)
     x_final_limit, y_final_limit, final_car_min_dist = getCarFinalParams()
     
     dataset = BumpercarDataset(
@@ -71,7 +73,7 @@ def main():
         y_final_limit=y_final_limit,
         final_car_min_dist=final_car_min_dist,
         std_init_theta = std_init_theta,
-        n_agents=2,
+        n_agents=n_agents,
     )
     
 # divide to train and test
@@ -81,10 +83,8 @@ def main():
 
 # data for plots
     t_ext = args.horizon * 4
-    n_agents = 2
-    nx = 7 * n_agents
 
-    plot_data = test_data[250:350, :, :]
+    plot_data = test_data[250:350, :, :].clone() 
     plot_data[:, 0, :nx] = dataset.x0.detach()
     plot_data = plot_data.to(device)
 
@@ -99,6 +99,7 @@ def main():
         params=car_params,
         x_init=plant_state_init,
         u_init=plant_input_init,
+        n_agents=n_agents,
         dt=0.04
     ).to(device)
 
@@ -156,7 +157,7 @@ def main():
         Q_final=Q_final,
         Qs=Qs,
         alpha_u=alpha_u,
-        xbar=train_data[0, :, 14:],
+        xbar=train_data[0, :, nx:],
         loss_bound=None,
         sat_bound=None,
         alpha_col=alpha_col,
@@ -218,6 +219,7 @@ def main():
         if epoch % args.log_epoch == 0:
             msg = 'Epoch: %i --- train loss: %.2f' % (epoch, loss.detach().item())
             loss_valid_value = None
+            is_best = False
 
             if args.return_best:
                 # rollout the current controller on the valid data
@@ -234,6 +236,7 @@ def main():
                     best_valid_loss = loss_valid_value
                     best_params_ren = ctl.get_parameters_as_vector()  # record state dict if best on valid
                     best_params_mlp = ctl.get_mlp_parameters()
+                    is_best = True
                     msg += ' (best so far)'
             checkpoint = {
                 "epoch": epoch,
@@ -252,6 +255,8 @@ def main():
             checkpoint_latest_file = os.path.join(checkpoint_folder, "checkpoint_latest.pt")
             torch.save(checkpoint, checkpoint_epoch_file)
             torch.save(checkpoint, checkpoint_latest_file)
+            if is_best:   # full controller with the lowest validation loss so far
+                torch.save(checkpoint, os.path.join(checkpoint_folder, "best.pt"))
             duration = time.time() - t
             msg += ' ---||--- time: %.0f s' % (duration)
             msg += f' ---||--- checkpoint: {checkpoint_epoch_file}'
