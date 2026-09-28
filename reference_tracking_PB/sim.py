@@ -12,7 +12,7 @@ from matplotlib.widgets import Slider
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(1, BASE_DIR)
 
-from experiment_params import getCarFinalParams, getCarInitParams, getLossParams, n_agents as N_AGENTS
+from experiment_params import getCarFinalParams, getCarInitParams, getLossParams, n_agents as N_AGENTS, args as ARGS
 from config import device
 from controllers import PerfBoostController
 from controllers.MLP import ZeroController
@@ -22,8 +22,8 @@ from plants.bumpercar.bumpercar_dataset import BumpercarDataset
 from utils.plot_functions import agent_color
 
 
-# Add your trained pRB checkpoint here. Prefer a checkpoint with MLP weights, e.g.
-TRAINED_PBR_MODEL_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/trained_pRB/rPB_best.pt")
+# Checkpoint to evaluate: --checkpoint <path>, default the provided one. Use a full checkpoint (with MLP weights).
+TRAINED_PBR_MODEL_PATH = ARGS.checkpoint or os.path.join(BASE_DIR, "experiments/bumpercar/trained_pRB/rPB_best.pt")
 
 EVALUATE_MODEL = True
 EVAL_HORIZON = 500
@@ -36,15 +36,28 @@ SIM_DATA_SPLIT = "train"
 SIM_SAMPLE_INDEX = 12
 SIM_RANDOM_SEED = EVAL_RANDOM_SEED
 OBSTACLE_RADIUS = 1.5
-REPORT_FIGURE_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/report_trajectory.svg")
-REPORT_COLLISION_FIGURE_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/report_collision.svg")
-REPORT_INIT_FIGURE_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/report_setup.svg")
-REPORT_SNAPSHOT_FIGURE_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/report_snapshots.svg")
-TRAJECTORY_GIF_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/trajectory.gif")
-ROLLOUT_METRICS_PATH = os.path.join(BASE_DIR, "experiments/bumpercar/rollout_metrics.csv")
 REPORT_FINAL_RADIUS = 1.0
 
 DT = 0.04
+
+
+def get_output_dir(checkpoint_path=None):
+    """
+    Folder for the figures, GIF and CSV of one checkpoint:
+    - checkpoint of a training run (.../<run>/checkpoints/<name>.pt) -> <run>/sim/<name>/
+    - any other checkpoint (e.g. the provided rPB_best.pt)             -> saved_results/sim_<name>/
+    """
+    checkpoint_path = os.path.abspath(checkpoint_path or TRAINED_PBR_MODEL_PATH)
+    checkpoint_dir = os.path.dirname(checkpoint_path)
+    name = os.path.splitext(os.path.basename(checkpoint_path))[0]
+    if os.path.basename(checkpoint_dir) == "checkpoints":
+        run_dir = os.path.dirname(checkpoint_dir)
+        return os.path.join(run_dir, "sim", name)
+    return os.path.join(BASE_DIR, "experiments", "bumpercar", "saved_results", f"sim_{name}")
+
+
+def output_file(filename):
+    return os.path.join(get_output_dir(), filename)
 
 
 
@@ -290,8 +303,10 @@ def evaluate_rollout_metrics(
     horizon=400,
     split="test",
     random_seed=EVAL_RANDOM_SEED,
-    save_path=ROLLOUT_METRICS_PATH,
+    save_path="auto",   # "auto": <output dir>/rollout_metrics.csv, None: don't save
 ):
+    if save_path == "auto":
+        save_path = output_file("rollout_metrics.csv")
     system = BumpercarSystem(
         params=car_params,
         x_init=None,
@@ -527,7 +542,8 @@ def draw_sample_regions(ax, colors):
         ax.add_patch(final_circle)
 
 
-def save_report_figure(path=REPORT_FIGURE_PATH):
+def save_report_figure(path=None):
+    path = path or output_file("report_trajectory.svg")
     x_log, xbar, dx_log, _ = simulate()
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
     n_agents = N_AGENTS
@@ -580,7 +596,8 @@ def save_report_figure(path=REPORT_FIGURE_PATH):
     print(f"[INFO] saved report figure to {path}")
 
 
-def save_snapshot_report_figure(path=REPORT_SNAPSHOT_FIGURE_PATH):
+def save_snapshot_report_figure(path=None):
+    path = path or output_file("report_snapshots.svg")
     x_log, xbar, dx_log, _ = simulate()
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
     n_agents = N_AGENTS
@@ -659,7 +676,8 @@ def save_snapshot_report_figure(path=REPORT_SNAPSHOT_FIGURE_PATH):
     print(f"[INFO] saved snapshot report figure to {path}")
 
 
-def save_collision_report_figure(path=REPORT_COLLISION_FIGURE_PATH):
+def save_collision_report_figure(path=None):
+    path = path or output_file("report_collision.svg")
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
     _, _, _, _, _, _, _, _, min_dist = getLossParams(device)
     x0_bumpercar, x_final, _, _, _, _ = getCarInitParams(device)
@@ -745,7 +763,8 @@ def save_collision_report_figure(path=REPORT_COLLISION_FIGURE_PATH):
     print(f"[INFO] saved collision report figure to {path}")
 
 
-def save_init_report_figure(path=REPORT_INIT_FIGURE_PATH):
+def save_init_report_figure(path=None):
+    path = path or output_file("report_setup.svg")
     x0_bumpercar, x_final, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
     n_agents = N_AGENTS
     colors = [agent_color(i) for i in range(n_agents)]
@@ -809,7 +828,8 @@ def save_init_report_figure(path=REPORT_INIT_FIGURE_PATH):
     print(f"[INFO] saved init report figure to {path}")
 
 
-def save_trajectory_gif(path=TRAJECTORY_GIF_PATH, frame_stride=4, fps=20):
+def save_trajectory_gif(path=None, frame_stride=4, fps=20):
+    path = path or output_file("trajectory.gif")
     x_log, xbar, dx_log, title = simulate()
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
     _, _, _, _, _, _, _, _, min_dist = getLossParams(device)
@@ -975,10 +995,19 @@ def show_simulation():
 
 
 if __name__ == "__main__":
-    # evaluate_rollout_metrics(num_runs=500, horizon=400, save_path="experiments/bumpercar/distances.csv")
+    print(f"[INFO] checkpoint: {TRAINED_PBR_MODEL_PATH}")
+    print(f"[INFO] outputs:    {get_output_dir()}")
     if EVALUATE_MODEL and TRAINED_PBR_MODEL_PATH:
         evaluate_controller()
     elif EVALUATE_MODEL:
         print("[INFO] skipping trained-model evaluation because TRAINED_PBR_MODEL_PATH is empty.")
+
+    # report tables (steady-state error, car-car and obstacle distances) + CSV, and the figures
+    evaluate_rollout_metrics(num_runs=500, horizon=400)
+    save_init_report_figure()
+    save_report_figure()
+    save_snapshot_report_figure()
+    save_trajectory_gif()
+
     show_simulation()
 

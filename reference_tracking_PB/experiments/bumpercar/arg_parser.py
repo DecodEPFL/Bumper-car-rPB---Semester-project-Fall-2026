@@ -34,6 +34,7 @@ def argument_parser():
     parser.add_argument('--log-epoch', type=int, default=-1, help='Frequency of logging in epochs. Default is 0.1 * epochs.')
     parser.add_argument('--return-best', action=argparse.BooleanOptionalAction, default=True, help='Return the best model on the validation data among all logged iterations. The train data can be used instead of validation data. The Default is True.')
     parser.add_argument('--load-controller', type=str, default=None, help='Optional path to a compatible trained controller checkpoint.')
+    parser.add_argument('--checkpoint', type=str, default=None, help='sim.py only: checkpoint to evaluate. Default is the provided trained_pRB/rPB_best.pt.')
 
     # TODO: add the following
     # parser.add_argument('--patience-epoch', type=int, default=None, help='Patience epochs for no progress. Default is None which sets it to 0.2 * total_epochs.')
