@@ -212,6 +212,9 @@ def load_controller(system, checkpoint_path):
         output_amplification=1,
         ren_internal_state_init=None,
         heading_encoding=args.get("heading_encoding", False),   # old checkpoints: raw heading
+        clock_tau=args.get("ren_clock_tau"),
+        dt=system.dt,
+        ref_change_input=args.get("ren_ref_change", False),
     ).to(device)
 
     if "controller_state_dict" in checkpoint:

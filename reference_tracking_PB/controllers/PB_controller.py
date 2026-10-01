@@ -31,6 +31,8 @@ class PerfBoostController(nn.Module):
         # misc
         output_amplification: float=20,
         heading_encoding: bool = False,
+        clock_tau: float = None, dt: float = 0.04,
+        ref_change_input: bool = False,
     ):
         """
          Args:
@@ -47,6 +49,11 @@ class PerfBoostController(nn.Module):
             ren_internal_state_init (torch.Tensor, optional): initial state of the REN. Defaults to 0 when None.
             heading_encoding (bool): if True, each car's heading entry of w_hat is replaced by
                 (sin, 1 - cos) before the REN and the MLP (8 instead of 7 inputs per car).
+            clock_tau (float): if set, the REN also gets a clock exp(-age dt / clock_tau) [s], with age = steps since
+                the last reference change (restarts at every new goal; t = 0 counts as a change). None = off.
+            dt (float): time step [s] of the plant, for the clock.
+            ref_change_input (bool): if True, the REN also gets the reference change per car:
+                delta goal (x, y) and delta target heading as (sin, 1 - cos). Non-zero only when the reference switches.
         """
         super().__init__()
 
@@ -62,6 +69,7 @@ class PerfBoostController(nn.Module):
         self.register_buffer("output_init", output_init.reshape(1, -1))
         self.register_buffer("vg_init", torch.zeros(1, output_init.shape[-1]))
         self.register_buffer("xbar_init", torch.zeros(1, output_init.shape[-1]))
+        self.register_buffer("theta_ref_init", torch.zeros(1, output_init.shape[-1] // 2))
 
         # set dimensions
         self.dim_in = self.input_init.shape[-1]
@@ -70,10 +78,13 @@ class PerfBoostController(nn.Module):
         self.heading_encoding = heading_encoding
         # size of the networks' input w_in: 7 per car, or 8 with (sin theta, 1 - cos theta) instead of theta
         self.dim_w_in = (8 if heading_encoding else 7) * self.n_agents
+        # REN input: w_in, plus the clock (1) and the reference change (4 per car: dx, dy, sin, 1 - cos) if enabled
+        self.clock_tau, self.dt, self.ref_change_input = clock_tau, dt, ref_change_input
+        self.dim_ren_in = self.dim_w_in + (1 if clock_tau is not None else 0) + (4 * self.n_agents if ref_change_input else 0)
 
         # define the REN
         self.c_ren = ContractiveREN(
-            dim_in=self.dim_w_in, dim_out=self.dim_out, dim_internal=dim_internal,
+            dim_in=self.dim_ren_in, dim_out=self.dim_out, dim_internal=dim_internal,
             dim_nl=dim_nl, initialization_std=initialization_std,
             internal_state_init=ren_internal_state_init,
             posdef_tol=posdef_tol, contraction_rate_lb=contraction_rate_lb
@@ -96,6 +107,8 @@ class PerfBoostController(nn.Module):
         self.last_output = self.output_init.detach().clone()
         self.last_vg = self.vg_init.detach().clone()
         self.last_xbar = self.xbar_init.detach().clone()
+        self.last_theta_ref = self.theta_ref_init.detach().clone()
+        self.clock_age = None   # steps since the last reference change, per sample (set at the first call)
 
         self.c_ren.x = self.c_ren.init_x    # reset the REN state to the initial value
 
@@ -116,13 +129,16 @@ class PerfBoostController(nn.Module):
 
         batch_size = input_t.shape[0]
 
-        # 1) internal model: predicted state from the previous state, input and reference
+        # 1) internal model: predicted state from the previous state and input, with the reference the plant used
+        #    in this step (the current one) -> a known reference change is not mistaken for a disturbance.
+        #    At t = 0 the stored initial memory (state, input and reference all 0) is used: the predicted state is 0,
+        #    so w_hat_0 = first measured state, and the jump to the real goal reaches M1 via the reference change.
         x_predicted, _ = self.noiseless_forward(
             t=self.t,
             x=self.last_input,    # last input to the controller is the last state of the plant
             u=self.last_output,   # last output of the controller is the last input to the plant
             v=self.last_vg,
-            xbar=self.last_xbar,
+            xbar=xbar if self.t > 0 else self.last_xbar,
         )                                                                     # [B, 1, 7*n_agents]
 
         # 2) reconstructed disturbance: measured state minus predicted state
@@ -140,9 +156,27 @@ class PerfBoostController(nn.Module):
         else:
             w_in = w_hat
 
-        # 4) M1 (REN) on w_in; M2 (MLP) on w_in, the goal (x, y) and the target heading
+        # 4) M1 (REN) input: w_in, plus optional exogenous l_p signals that let M1 act after w_hat has vanished
+        delta_xbar = xbar - self.last_xbar                                    # [B, 1, 2*n_agents]  reference change
+        delta_theta = theta_ref - self.last_theta_ref                         # [B, 1, n_agents]
+        ren_parts = [w_in]
+        if self.clock_tau is not None:
+            # clock s = exp(-age dt / tau), age = steps since the last reference change of this sample
+            # (t = 0 counts as a change: the initial reference is 0) -> restarts for every new goal;
+            # finitely many changes -> finite sum of decaying exponentials -> l_p
+            ref_changed = (delta_xbar.abs().sum(-1, keepdim=True) + (1 - torch.cos(delta_theta)).sum(-1, keepdim=True)) > 0   # [B, 1, 1]
+            self.clock_age = torch.zeros_like(ref_changed, dtype=w_in.dtype) if self.clock_age is None else self.clock_age + 1
+            self.clock_age = torch.where(ref_changed, torch.zeros_like(self.clock_age), self.clock_age)
+            clock = torch.exp(-self.clock_age * self.dt / self.clock_tau)      # [B, 1, 1]
+            ren_parts.append(clock)
+        if self.ref_change_input:
+            # reference change itself: non-zero only at a switch (and at t = 0, from the zero initial reference) -> l_p
+            ren_parts += [delta_xbar, torch.sin(delta_theta), 1 - torch.cos(delta_theta)]
+        ren_input = torch.cat(ren_parts, dim=2)                               # [B, 1, dim_ren_in]
+
+        # 5) M1 (REN) on ren_input; M2 (MLP) on w_in, the goal (x, y) and the target heading
         #    as (sin theta*, 1 - cos theta*) per car. theta* is not given to the REN: it does not vanish, so it would break l_p
-        output_REN = self.c_ren.forward(w_in)
+        output_REN = self.c_ren.forward(ren_input)
         mlp_input = torch.cat((w_in, xbar, torch.sin(theta_ref), 1 - torch.cos(theta_ref)), dim=2).view(batch_size, 1, -1)
         output_MLP = self.MLP.forward(mlp_input)
 
@@ -150,6 +184,7 @@ class PerfBoostController(nn.Module):
         #output = torch.clamp(output,min = -10,max = 10)
         # update internal states
         self.last_input, self.last_output, self.last_xbar = input_t, output, xbar
+        self.last_theta_ref = theta_ref
         self.last_vg = vg
         self.t += 1
         return output

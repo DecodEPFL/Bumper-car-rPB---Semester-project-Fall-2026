@@ -1,4 +1,4 @@
-import argparse, math
+import argparse
 
 
 # argument parser
@@ -11,9 +11,9 @@ def argument_parser():
     parser.add_argument('--obst-av', action=argparse.BooleanOptionalAction, default=True, help='Avoid obstacles. Default is True.')
     parser.add_argument('--save-path', type=str, default=None, help='Optional output directory for saved results and checkpoints.')
     # dataset
-    parser.add_argument('--horizon', type=int, default=100, help='Time horizon for the computation. Default is 100.')
+    parser.add_argument('--horizon', type=int, default=400, help='Time horizon in steps (dt = 0.04 s). Default is 400 (16 s).')
     parser.add_argument('--n-agents', type=int, default=2, help='Number of agents. Default is 2.')
-    parser.add_argument('--num-rollouts', type=int, default=30, help='Number of rollouts in the training data. Default is 30.')
+    parser.add_argument('--num-rollouts', type=int, default=400, help='Number of rollouts in the training data. Default is 400.')
     parser.add_argument('--goal-heading-range', type=float, default=0.0, help='Target heading per car sampled uniformly within +-this many degrees around the scenario heading. Default is 0 (off: exactly the SCENARIOS heading).')
     parser.add_argument('--start-radius', type=float, default=0.3, help='Start position per car sampled uniformly in a disk of this radius [m] around the scenario start. Default is 0.3.')
     parser.add_argument('--start-heading-range', type=float, default=10.0, help='Start heading per car sampled uniformly within +-this many degrees around the scenario heading. Default is 10.')
@@ -22,28 +22,30 @@ def argument_parser():
     parser.add_argument('--cont-init-std', type=float, default=0.1, help='Initialization std for controller params. Default is 0.1.')
     parser.add_argument('--dim-internal', type=int, default=8, help='Dimension of the internal state of the controller. Adjusts the size of the linear part of REN. Default is 8.')
     parser.add_argument('--dim-nl', type=int, default=8, help='size of the non-linear part of REN. Default is 8.')
+    parser.add_argument('--ren-clock-tau', type=float, default=None, help='Time constant [s] of an extra REN input exp(-t / tau), t = time since the last reference change. Lets the REN act after w_hat has vanished. Default is None (off).')
+    parser.add_argument('--ren-ref-change', action=argparse.BooleanOptionalAction, default=False, help='Feed the reference change per car (delta goal x, y and delta target heading as sin, 1 - cos) to the REN. Default is False.')
     parser.add_argument('--heading-encoding', action=argparse.BooleanOptionalAction, default=True, help='Feed each car heading in w_hat to the controller as (sin, 1 - cos) instead of the raw angle. Default is True (--no-heading-encoding for the raw angle).')
 
     # loss
     parser.add_argument('--alpha-u', type=float, default=0.1/400, help='Weight of the loss due to control input "u". Default is 0.1/400.')  #TODO: 400 is output_amplification^2
-    parser.add_argument('--alpha-col', type=float, default=500, help='Weight of the collision avoidance loss. Default is 100 if "col-av" is True, else None.')
-    parser.add_argument('--alpha-obst', type=float, default=10e3, help='Weight of the obstacle avoidance loss. Default is 5e3 if "obst-av" is True, else None.')
-    parser.add_argument('--obst-safe-dist', type=float, default=None, help='Obstacle cost is 0 beyond this distance [m] from each obstacle center (Gaussian minus its value there, clipped at 0). Default is None (no cutoff).')
+    parser.add_argument('--alpha-col', type=float, default=1500, help='Weight of the collision avoidance loss. Default is 1500 if "col-av" is True, else None.')
+    parser.add_argument('--alpha-obst', type=float, default=20000, help='Weight of the obstacle avoidance loss. Default is 20000 if "obst-av" is True, else None.')
+    parser.add_argument('--obst-safe-dist', type=float, default=1.7, help='Obstacle cost is 0 beyond this distance [m] from each obstacle center (Gaussian minus its value there, clipped at 0). Default is 1.7 (sim.py hit radius 1.5 + 0.2 margin).')
     parser.add_argument('--min-dist', type=float, default=2.0, help='Minimum distance [m] between car centers; the collision loss is active below min_dist + 0.2. Default is 2.0 if "col-av" is True, else None.')
-    parser.add_argument('--alpha-heading', type=float, default=0.0, help='Weight of the running heading loss 1 - cos(theta* - theta), weighted by exp(-d^2 / (2 * heading_radius^2)) with d the distance to the goal. Default is 0 (off).')
-    parser.add_argument('--alpha-heading-final', type=float, default=0.0, help='Weight of the terminal heading loss over the last --heading-final-steps steps. Default is 0 (off).')
-    parser.add_argument('--heading-radius', type=float, default=0.5, help='Length scale [m] of the soft mask of the running heading loss (weight 0.61 at this distance from the goal). Default is 0.5.')
+    parser.add_argument('--alpha-heading', type=float, default=20.0, help='Weight of the running heading loss 1 - cos(theta* - theta), weighted by exp(-d^2 / (2 * heading_radius^2)) with d the distance to the goal. Default is 20 (0 = off).')
+    parser.add_argument('--alpha-heading-final', type=float, default=10.0, help='Weight of the terminal heading loss over the last --heading-final-steps steps. Default is 10 (0 = off).')
+    parser.add_argument('--heading-radius', type=float, default=1.5, help='Length scale [m] of the soft mask of the running heading loss (weight 0.61 at this distance from the goal). Default is 1.5.')
     parser.add_argument('--alpha-offset-final', type=float, default=0.0, help='Weight of the squared rPB offset dxref over the last --heading-final-steps steps (the car must have settled by the end). Default is 0 (off).')
     parser.add_argument('--heading-final-steps', type=int, default=50, help='Number of final time steps averaged in the terminal heading loss. Default is 50 (2 s at dt 0.04).')
 
     # optimizer
-    parser.add_argument('--batch-size', type=int, default=5, help='Number of forward trajectories of the closed-loop system at each step. Default is 5.')
-    parser.add_argument('--epochs', type=int, default=-1, help='Total number of epochs for training. Default is 5000 if collision avoidance, else 100.')
-    parser.add_argument('--lr', type=float, default=-1, help='Learning rate. Default is 2e-3 if collision avoidance, else 5e-3.')
-    parser.add_argument('--log-epoch', type=int, default=-1, help='Frequency of logging in epochs. Default is 0.1 * epochs.')
+    parser.add_argument('--batch-size', type=int, default=100, help='Number of forward trajectories of the closed-loop system at each step (-1 = all training rollouts). Default is 100.')
+    parser.add_argument('--epochs', type=int, default=300, help='Total number of epochs for training. Default is 300.')
+    parser.add_argument('--lr', type=float, default=2e-3, help='Initial learning rate. Default is 2e-3.')
+    parser.add_argument('--log-epoch', type=int, default=5, help='Frequency of logging, validation and checkpoints in epochs. Default is 5.')
     parser.add_argument('--lr-schedule', type=str, default='cosine', choices=['constant', 'linear', 'cosine'], help='Learning-rate schedule over the epochs. Default is cosine.')
     parser.add_argument('--lr-end-factor', type=float, default=0.05, help='Learning rate at the last epoch as a fraction of --lr (linear/cosine schedules). Default is 0.05.')
-    parser.add_argument('--grad-clip', type=float, default=None, help='Clip the gradient norm of each step to this value. Default is None (no clipping; the norm is still logged).')
+    parser.add_argument('--grad-clip', type=float, default=3000, help='Clip the gradient norm of each step to this value (--grad-clip inf = no clipping; the norm is always logged). Default is 3000.')
     parser.add_argument('--return-best', action=argparse.BooleanOptionalAction, default=True, help='Return the best model on the validation data among all logged iterations. The train data can be used instead of validation data. The Default is True.')
     parser.add_argument('--load-controller', type=str, default=None, help='Optional path to a compatible trained controller checkpoint.')
     parser.add_argument('--checkpoint', type=str, default=None, help='sim.py only: checkpoint to evaluate. Default is the provided trained_pRB/rPB_best.pt.')
@@ -63,17 +65,6 @@ def argument_parser():
     if args.batch_size == -1:
         args.batch_size = args.num_rollouts  # use all train data
 
-    if args.epochs == -1 or args.epochs is None:
-        args.epochs = 200 if args.col_av else 50
-
-    if args.lr == -1 or args.lr is None:
-        # args.lr = 2e-3 if args.col_av else 5e-3
-        args.lr = 8e-4
-
-    if args.log_epoch == -1 or args.log_epoch is None:
-        # args.log_epoch = math.ceil(float(args.epochs)/10)
-        args.log_epoch = 20
-
     # assertions and warning
     if not args.col_av:
         args.alpha_col = None
@@ -83,9 +74,6 @@ def argument_parser():
 
     # if args.total_epochs < 10000:
     #     print(f'Minimum of 10000 epochs are required for proper training')
-
-    if args.horizon > 100:
-        print(f'Long horizons may be unnecessary and pose significant computation')
 
     return args
 
@@ -98,6 +86,7 @@ def print_args(args):
 
     msg += '\n[INFO] Controller: dimension of the internal state: %i' % args.dim_internal
     msg += ' -- dim_nl: %i' % args.dim_nl + ' -- cont_init_std: %.2f'% args.cont_init_std
+    msg += ' -- REN clock tau: %s s -- REN reference change: %s' % (args.ren_clock_tau, args.ren_ref_change)
 
     msg += '\n[INFO] Loss:  alpha_u: %.6f' % args.alpha_u
     msg += ' -- alpha_col: %.f -- min_dist: %g' % (args.alpha_col, args.min_dist) if args.col_av else ' -- no collision avoidance'

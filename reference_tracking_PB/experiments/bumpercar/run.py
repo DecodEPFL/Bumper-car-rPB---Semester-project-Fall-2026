@@ -115,6 +115,9 @@ def main():
     output_amplification=1,
     ren_internal_state_init=None,
     heading_encoding=args.heading_encoding,
+    clock_tau=args.ren_clock_tau,
+    dt=sys.dt,
+    ref_change_input=args.ren_ref_change,
 ).to(device)
 
     if args.load_controller is not None:
