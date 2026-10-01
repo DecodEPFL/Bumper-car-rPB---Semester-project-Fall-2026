@@ -12,7 +12,8 @@ from matplotlib.widgets import Slider
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(1, BASE_DIR)
 
-from experiment_params import getCarFinalParams, getCarInitParams, getLossParams, n_agents as N_AGENTS, args as ARGS
+import experiment_params
+from experiment_params import getCarFinalParams, getCarInitParams, getLossParams, getExtraLossParams, n_agents as N_AGENTS, args as ARGS
 from config import device
 from controllers import PerfBoostController
 from controllers.MLP import ZeroController
@@ -25,6 +26,27 @@ from utils.plot_functions import agent_color
 # Checkpoint to evaluate: --checkpoint <path>, default the provided one. Use a full checkpoint (with MLP weights).
 TRAINED_PBR_MODEL_PATH = ARGS.checkpoint or os.path.join(BASE_DIR, "experiments/bumpercar/trained_pRB/rPB_best.pt")
 
+# Training settings of the evaluated run override sim.py's own flags: same car count, start/goal spreads,
+# loss weights and scenario as in training. Evaluation seed, horizon and violation distances stay sim.py's own.
+TRAINING_SETTINGS = ["n_agents", "start_radius", "start_heading_range", "goal_heading_range",
+                     "alpha_u", "alpha_col", "alpha_obst", "min_dist", "obst_safe_dist",
+                     "alpha_heading", "alpha_heading_final", "heading_radius", "heading_final_steps", "alpha_offset_final"]
+checkpoint = torch.load(TRAINED_PBR_MODEL_PATH, map_location="cpu", weights_only=False)
+stored_args = checkpoint.get("args", {})
+stored_args = stored_args if isinstance(stored_args, dict) else vars(stored_args)
+for name in TRAINING_SETTINGS:
+    if name in stored_args:
+        setattr(ARGS, name, stored_args[name])
+missing = [name for name in TRAINING_SETTINGS if name not in stored_args]
+if missing:
+    print(f"[WARN] checkpoint does not store {missing}; using sim.py's flags for these")
+experiment_params.n_agents = N_AGENTS = ARGS.n_agents
+if "scenario" in checkpoint:
+    experiment_params.SCENARIOS[N_AGENTS] = {"start": checkpoint["scenario"]["start"], "goal": checkpoint["scenario"]["goal"]}
+    experiment_params.OBSTACLES = checkpoint["scenario"]["obstacles"]
+else:
+    print("[WARN] checkpoint does not store its scenario; using the current SCENARIOS and OBSTACLES")
+
 EVALUATE_MODEL = True
 EVAL_HORIZON = 500
 EVAL_NUM_ROLLOUTS = 100
@@ -36,6 +58,7 @@ SIM_DATA_SPLIT = "train"
 SIM_SAMPLE_INDEX = 12
 SIM_RANDOM_SEED = EVAL_RANDOM_SEED
 OBSTACLE_RADIUS = 1.5
+EVAL_MIN_DIST = 2.0   # car-car safety distance for metrics and figures (independent of the training loss)
 REPORT_FINAL_RADIUS = 1.0
 
 DT = 0.04
@@ -104,7 +127,7 @@ def make_crossing_data(horizon, n_agents=N_AGENTS):
 
 
 def make_eval_data(horizon, num_rollouts, num_test_rollouts, random_seed):
-    x0_bumpercar, x_final_bumpercar, _ , _, car_init_radius, std_init_theta = getCarInitParams(device)
+    x0_bumpercar, x_final_bumpercar, _ , _, car_init_radius, start_heading_range = getCarInitParams(device)
     x_final_limit, y_final_limit, final_car_min_dist = getCarFinalParams()
     
     dataset = BumpercarDataset(
@@ -116,8 +139,9 @@ def make_eval_data(horizon, num_rollouts, num_test_rollouts, random_seed):
         x_final_limit=x_final_limit,
         y_final_limit=y_final_limit,
         final_car_min_dist=final_car_min_dist,
-        std_init_theta = std_init_theta,
+        start_heading_range=start_heading_range,
         n_agents=N_AGENTS,
+        goal_heading_range=ARGS.goal_heading_range * torch.pi / 180,   # pass the training run's --goal-heading-range
     )
     train_data, test_data = dataset.get_data(
         num_train_samples=num_rollouts,
@@ -146,6 +170,7 @@ def make_loss_fn(train_data, n_agents=N_AGENTS):
         n_agents=n_agents,
         position_deadzone=position_deadzone,
         steady_state_velocity_radius=steady_state_velocity_radius,
+        **getExtraLossParams(),
     )
 
 
@@ -186,6 +211,7 @@ def load_controller(system, checkpoint_path):
         initialization_std=args.get("cont_init_std", 0.1),
         output_amplification=1,
         ren_internal_state_init=None,
+        heading_encoding=args.get("heading_encoding", False),   # old checkpoints: raw heading
     ).to(device)
 
     if "controller_state_dict" in checkpoint:
@@ -232,7 +258,7 @@ def evaluate_controller():
     with torch.no_grad():
         x_log, e_log, u_log = system.rollout(controller, train_data, train=False)
         train_loss = loss_fn.forward(x_log, u_log, e_log).item()
-        train_collisions = loss_fn.count_collisions(x_log)
+        train_collisions = loss_fn.count_collisions(x_log, min_dist=EVAL_MIN_DIST)
         train_obstacle_collision_indices = obstacle_collision_indices(
             x_log,
             obstacle_centers,
@@ -241,7 +267,7 @@ def evaluate_controller():
 
         x_log, e_log, u_log = system.rollout(controller, test_data, train=False)
         test_loss = loss_fn.forward(x_log, u_log, e_log).item()
-        test_collisions = loss_fn.count_collisions(x_log)
+        test_collisions = loss_fn.count_collisions(x_log, min_dist=EVAL_MIN_DIST)
         test_obstacle_collision_indices = obstacle_collision_indices(
             x_log,
             obstacle_centers,
@@ -342,11 +368,17 @@ def evaluate_rollout_metrics(
     pos_idx = system.pos_indices()
     n_agents = system.n_agents
     _, _, obstacle_centers, _, _, _ = getCarInitParams(device)
-    _, _, _, _, _, _, _, _, min_dist = getLossParams(device)
+    min_dist = EVAL_MIN_DIST
 
     final_pos = x_log[:, -1, pos_idx].reshape(num_runs, n_agents, 2)
     final_ref = data[:, -1, nx + torch.tensor(pos_idx, device=data.device)].reshape(num_runs, n_agents, 2)
     steady_state_error = torch.linalg.norm(final_pos - final_ref, dim=-1)
+
+    # final heading error per car [deg], wrapped to [0, 180]
+    final_theta = x_log[:, -1, 2::7]                                                 # [runs, n_agents]
+    target_theta = data[:, -1, nx + 2::7]                                            # [runs, n_agents] theta*
+    heading_difference = target_theta - final_theta
+    final_heading_error = torch.rad2deg(torch.atan2(torch.sin(heading_difference), torch.cos(heading_difference))).abs()
 
     rollout_horizon = x_log.shape[1]
     positions = x_log[:, :, pos_idx].reshape(num_runs, rollout_horizon, n_agents, 2)
@@ -371,6 +403,7 @@ def evaluate_rollout_metrics(
         "x_log": x_log.detach().cpu(),
         "u_log": u_log.detach().cpu(),
         "steady_state_error": steady_state_error.detach().cpu(),
+        "final_heading_error_deg": final_heading_error.detach().cpu(),
         "closest_car_distance": closest_car_distance.detach().cpu(),
         "closest_obstacle_distance": closest_obstacle_distance.detach().cpu(),
         "closest_obstacle_distance_by_center": closest_obstacle_distance_by_center.detach().cpu(),
@@ -389,6 +422,13 @@ def evaluate_rollout_metrics(
     print(f"  RMSE: {format_list(rmse(metrics['steady_state_error']))}")
     print(f"  Std:  {format_list(metrics['steady_state_error'].std(dim=0, unbiased=False))}")
     print(f"  Worst/highest: {format_list(metrics['steady_state_error'].max(dim=0).values)}")
+
+    print("[SUMMARY] Final heading error per car [deg]")
+    heading_errors = metrics["final_heading_error_deg"]
+    print(f"  RMS:  {format_list(rmse(heading_errors))}")
+    print(f"  Std:  {format_list(heading_errors.std(dim=0, unbiased=False))}")
+    print(f"  Worst/highest: {format_list(heading_errors.max(dim=0).values)}")
+    print(f"  Runs below 10 deg [%]: {format_list((heading_errors < 10).float().mean(dim=0) * 100)}")
 
     print("[SUMMARY] Closest car-car distance [m]")
     print(f"  RMS: {format_list(rmse(metrics['closest_car_distance']))}")
@@ -419,6 +459,7 @@ def evaluate_rollout_metrics(
             fieldnames = (
                 ["run", "closest_car_distance"]
                 + [f"steady_state_error_car_{i + 1}" for i in range(n_agents)]
+                + [f"final_heading_error_deg_car_{i + 1}" for i in range(n_agents)]
                 + [f"closest_obstacle_distance_car_{i + 1}" for i in range(n_agents)]
                 + [
                     f"closest_obstacle_distance_car_{i + 1}_obstacle_{j + 1}"
@@ -436,6 +477,7 @@ def evaluate_rollout_metrics(
                 }
                 for i in range(n_agents):
                     row[f"steady_state_error_car_{i + 1}"] = steady_state_error[run_idx, i].item()
+                    row[f"final_heading_error_deg_car_{i + 1}"] = final_heading_error[run_idx, i].item()
                     row[f"closest_obstacle_distance_car_{i + 1}"] = closest_obstacle_distance[run_idx, i].item()
                     for j in range(len(obstacle_centers)):
                         row[f"closest_obstacle_distance_car_{i + 1}_obstacle_{j + 1}"] = (
@@ -679,7 +721,7 @@ def save_snapshot_report_figure(path=None):
 def save_collision_report_figure(path=None):
     path = path or output_file("report_collision.svg")
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
-    _, _, _, _, _, _, _, _, min_dist = getLossParams(device)
+    min_dist = EVAL_MIN_DIST
     x0_bumpercar, x_final, _, _, _, _ = getCarInitParams(device)
     n_agents = 2   # illustration of the two-car crossing (first two cars only)
     colors = [agent_color(i) for i in range(n_agents)]
@@ -832,7 +874,7 @@ def save_trajectory_gif(path=None, frame_stride=4, fps=20):
     path = path or output_file("trajectory.gif")
     x_log, xbar, dx_log, title = simulate()
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
-    _, _, _, _, _, _, _, _, min_dist = getLossParams(device)
+    min_dist = EVAL_MIN_DIST
     n_agents = N_AGENTS
     colors = [agent_color(i) for i in range(n_agents)]
     frames = list(range(0, x_log.shape[0], frame_stride))
@@ -917,7 +959,7 @@ def save_trajectory_gif(path=None, frame_stride=4, fps=20):
 def show_simulation():
     x_log, xbar, dx_log, title = simulate()
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
-    _, _, _, _, _, _, _, _, min_dist = getLossParams(device)
+    min_dist = EVAL_MIN_DIST
     n_agents = N_AGENTS
     colors = [agent_color(i) for i in range(n_agents)]
 

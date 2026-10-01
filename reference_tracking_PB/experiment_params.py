@@ -2,8 +2,6 @@ import torch
 
 from experiments.bumpercar.arg_parser import argument_parser
 
-STD_INIT_XY = 0.2
-STD_INIT_THETA = 10/360*2*torch.pi
 args = argument_parser()
 n_agents = args.n_agents
 
@@ -12,14 +10,17 @@ n_agents = args.n_agents
 SCENARIOS = {
     2: {
         "start": [(-2.0, -2.5, 0.0), (2.0, -2.5, -torch.pi)],
-        "goal": [(2.0, 3.0, torch.pi / 2), (-2.0, 3.0, torch.pi / 2)],
+        "goal": [(2.0, 4.5, torch.pi / 2), (-2.0, 4.5, torch.pi / 2)],
     },
     # TODO: placeholder 3-car scenario (car 3 drives top -> bottom through the gap); define the real one.
     3: {
         "start": [(-2.0, -2.5, 0.0), (2.0, -2.5, -torch.pi), (0.0, 4.5, -torch.pi / 2)],
-        "goal": [(2.0, 3.0, torch.pi / 2), (-2.0, 3.0, torch.pi / 2), (0.0, -3.5, -torch.pi / 2)],
+        "goal": [(2.0, 4.5, torch.pi / 2), (-2.0, 4.5, torch.pi / 2), (0.0, -3.5, -torch.pi / 2)],
     },
 }
+
+# Gaussian obstacles: centers (x, y) and diagonal covariance, shared by all scenarios
+OBSTACLES = {"centers": [(-2.0, 0.0), (2.0, 0.0)], "cov": (0.44, 0.44)}
 
 
 def _poses_to_state(poses):
@@ -33,16 +34,13 @@ def getCarInitParams(device):
     x0_bumpercar = _poses_to_state(SCENARIOS[n_agents]["start"])
     x_final = _poses_to_state(SCENARIOS[n_agents]["goal"])
 
-    obstacle_centers = [
-        torch.tensor([[-2.0, 0.0]], device=device),
-        torch.tensor([[2.0, 0.0]], device=device),
-    ]
-    obstacle_covs = [torch.tensor([[0.44, 0.44]], device=device)] * len(obstacle_centers)
+    obstacle_centers = [torch.tensor([center], device=device) for center in OBSTACLES["centers"]]
+    obstacle_covs = [torch.tensor([OBSTACLES["cov"]], device=device)] * len(obstacle_centers)
     
-    car_init_radius = 0.3
-    std_init_theta = STD_INIT_THETA
-    
-    return x0_bumpercar, x_final, obstacle_centers, obstacle_covs, car_init_radius, std_init_theta
+    car_init_radius = args.start_radius                              # [m] start position spread
+    start_heading_range = args.start_heading_range * torch.pi / 180   # [rad] start heading spread, +-
+
+    return x0_bumpercar, x_final, obstacle_centers, obstacle_covs, car_init_radius, start_heading_range
 
 def getCarFinalParams():
     x_final_limit = (-2.5, 2.5) 
@@ -57,12 +55,12 @@ def getLossParams(device):
     ], device=device)) / 15
     
     Q = torch.kron(torch.eye(n_agents, device=device), Q_agent)
-    Q_final = Q * 20
+    Q_final = Q * 60
     Qs = torch.kron(torch.eye(n_agents), torch.eye(1)).to(device)
 
     position_deadzone = 0.01
     steady_state_velocity_radius = 0.1
-    min_dist = 2 if args.col_av else None   # BumpercarLoss requires None together with alpha_col=None
+    min_dist = args.min_dist   # None under --no-col-av; BumpercarLoss requires None together with alpha_col=None
 
     return (
         Q,
@@ -74,4 +72,16 @@ def getLossParams(device):
         position_deadzone,
         steady_state_velocity_radius,
         min_dist
+    )
+
+
+def getExtraLossParams():
+    """Heading, terminal offset and obstacle cutoff settings for BumpercarLoss (defaults = off)."""
+    return dict(
+        alpha_heading=args.alpha_heading,
+        alpha_heading_final=args.alpha_heading_final,
+        heading_radius=args.heading_radius,
+        heading_final_steps=args.heading_final_steps,
+        alpha_offset_final=args.alpha_offset_final,
+        obst_safe_dist=args.obst_safe_dist,
     )

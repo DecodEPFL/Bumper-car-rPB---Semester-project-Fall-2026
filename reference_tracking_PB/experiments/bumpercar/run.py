@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(1, BASE_DIR)
 
-from experiment_params import getCarFinalParams, getCarInitParams, getLossParams
+from experiment_params import getCarFinalParams, getCarInitParams, getLossParams, getExtraLossParams, SCENARIOS, OBSTACLES
 from controllers.MLP import ZeroController
 from config import device
 from arg_parser import argument_parser, print_args
@@ -60,7 +60,7 @@ def main():
     # [x, y, theta, vf, beta_f, beta_r, delta] for each car
     n_agents = args.n_agents
     nx = 7 * n_agents
-    x0_bumpercar,x_final_bumpercar, obstacle_centers, obstacle_covs, car_init_radius, std_init_theta = getCarInitParams(device)
+    x0_bumpercar,x_final_bumpercar, obstacle_centers, obstacle_covs, car_init_radius, start_heading_range = getCarInitParams(device)
     x_final_limit, y_final_limit, final_car_min_dist = getCarFinalParams()
     
     dataset = BumpercarDataset(
@@ -72,8 +72,9 @@ def main():
         x_final_limit=x_final_limit,
         y_final_limit=y_final_limit,
         final_car_min_dist=final_car_min_dist,
-        std_init_theta = std_init_theta,
+        start_heading_range=start_heading_range,
         n_agents=n_agents,
+        goal_heading_range=args.goal_heading_range * torch.pi / 180,
     )
     
 # divide to train and test
@@ -113,6 +114,7 @@ def main():
     initialization_std=args.cont_init_std,
     output_amplification=1,
     ren_internal_state_init=None,
+    heading_encoding=args.heading_encoding,
 ).to(device)
 
     if args.load_controller is not None:
@@ -168,13 +170,27 @@ def main():
         n_agents=n_agents,
         position_deadzone=position_deadzone,
         steady_state_velocity_radius=steady_state_velocity_radius,
+        **getExtraLossParams(),
     )
  
 # ------------ 5. Optimizer ------------
     valid_data = train_data      # use the entire train data for validation
     assert not (valid_data is None and args.return_best)
     optimizer = torch.optim.Adam(ctl.parameters(), lr=args.lr)
- 
+
+    # learning-rate schedule over the epochs: constant, or decaying to lr * lr_end_factor at the last epoch
+    lr_end = args.lr * args.lr_end_factor
+    if args.lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=lr_end)
+    elif args.lr_schedule == "linear":
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1.0, end_factor=args.lr_end_factor, total_iters=args.epochs,
+        )
+    else:
+        scheduler = None
+    # gradient clipping: max gradient norm per step (inf = no clipping, the norm is still measured and logged)
+    grad_clip = args.grad_clip if args.grad_clip is not None else float("inf")
+
 # ------------ 6. Training ------------
 # baseline: P-controller only (no rPB correction), from the nominal start to the nominal goal
     logger.info("Plotting closed-loop trajectory with the P-controller only...")
@@ -202,6 +218,7 @@ def main():
     best_valid_loss = 1e6
     t = time.time()
     for epoch in range(1 + args.epochs):
+        max_grad_norm = 0.0   # largest gradient norm (before clipping) in this epoch
         # iterate over all data batches
         for train_data_batch in train_dataloader:
             optimizer.zero_grad()
@@ -213,11 +230,14 @@ def main():
             loss = loss_fn.forward(x_log, u_log, e_log)
             # take a step
             loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(ctl.parameters(), grad_clip)   # returns the norm before clipping
+            max_grad_norm = max(max_grad_norm, grad_norm.item())
             optimizer.step()
 
         # print info
         if epoch % args.log_epoch == 0:
             msg = 'Epoch: %i --- train loss: %.2f' % (epoch, loss.detach().item())
+            msg += ' ---||--- lr: %.2e ---||--- max grad norm: %.3g' % (optimizer.param_groups[0]['lr'], max_grad_norm)
             loss_valid_value = None
             is_best = False
 
@@ -231,6 +251,7 @@ def main():
                     loss_valid = loss_fn.forward(x_log_valid, u_log_valid, e_log_valid)
                 loss_valid_value = loss_valid.item()
                 msg += ' ---||--- validation loss: %.2f' % loss_valid_value
+                msg += ' [' + ', '.join('%s %.2f' % (name, value) for name, value in loss_fn.last_terms.items()) + ']'
                 # compare with the best valid loss
                 if loss_valid_value < best_valid_loss:
                     best_valid_loss = loss_valid_value
@@ -247,6 +268,7 @@ def main():
                 "Q": Q,
                 "Q_final": Q_final,
                 "args": vars(args),
+                "scenario": {**SCENARIOS[n_agents], "obstacles": OBSTACLES},   # starts, goals, obstacles of this run
                 "train_loss": loss.detach().item(),
                 "validation_loss": loss_valid_value,
                 "best_valid_loss": best_valid_loss if args.return_best else None,
@@ -262,6 +284,9 @@ def main():
             msg += f' ---||--- checkpoint: {checkpoint_epoch_file}'
             logger.info(msg)
             t = time.time()
+
+        if scheduler is not None:
+            scheduler.step()   # once per epoch
 
     # set to best seen during training
     if args.return_best:

@@ -10,9 +10,12 @@ class BumpercarLoss(LQLossFH):
         loss_bound=None, sat_bound=None,
         n_agents=2, min_dist=0.5,
         obstacle_centers=None, obstacle_covs=None,
+        obst_safe_dist=None,
         position_deadzone=0.0,
         steady_state_velocity_radius=None,
-
+        alpha_heading=0.0, alpha_heading_final=0.0,
+        heading_radius=0.5, heading_final_steps=50,
+        alpha_offset_final=0.0,
     ):
         super().__init__(Q=Q, R=alpha_u, loss_bound=loss_bound, sat_bound=sat_bound, xbar=None)
         self.Qs = Qs
@@ -21,6 +24,9 @@ class BumpercarLoss(LQLossFH):
         self.n_agents = n_agents
         self.position_deadzone = position_deadzone
         self.steady_state_velocity_radius = steady_state_velocity_radius
+        self.alpha_heading, self.alpha_heading_final = alpha_heading, alpha_heading_final
+        self.heading_radius, self.heading_final_steps = heading_radius, heading_final_steps
+        self.alpha_offset_final = alpha_offset_final
         self.alpha_col, self.alpha_obst, self.min_dist = alpha_col, alpha_obst, min_dist
         assert (self.alpha_col is None and self.min_dist is None) or not (self.alpha_col is None or self.min_dist is None)
         if self.alpha_col is not None:
@@ -41,6 +47,10 @@ class BumpercarLoss(LQLossFH):
             ] * len(self.obstacle_centers)
         else:
             self.obstacle_covs = obstacle_covs
+        # obstacle cost is 0 beyond this distance from each center (None = no cutoff); needs isotropic covariances
+        self.obst_safe_dist = obst_safe_dist
+        if self.obst_safe_dist is not None:
+            assert all(cov.flatten()[0] == cov.flatten()[1] for cov in self.obstacle_covs)
 
         # mask
         self.mask = torch.logical_not(torch.eye(self.n_agents, device=device))   # shape = (n_agents, n_agents)
@@ -52,14 +62,14 @@ class BumpercarLoss(LQLossFH):
         assert self.Q.shape[0] == 7 * self.n_agents
         assert self.Q_final.shape == self.Q.shape
 
-    def forward(self, xs, us,es):
+    def forward(self, xs, us, es):
         """
         Compute loss.
 
         Args:
             - xs: tensor of shape (S, T, state_dim)
             - us: tensor of shape (S, T, in_dim)
-
+            - es: tensor of shape (S, T, error_dim)
         Return:
             - loss of shape (1, 1).
         """
@@ -96,7 +106,30 @@ class BumpercarLoss(LQLossFH):
             torch.matmul(speed.transpose(-1, -2), self.Qs),
             speed
         )   # shape = (S, T, 1, 1)
-        loss_speed = torch.sum(sTQs, 1) / speed.shape[1] 
+        loss_speed = torch.sum(sTQs, 1) / speed.shape[1]
+
+        # heading loss: 1 - cos(theta* - theta) per car -> 0 when aligned, 2 when opposite, no +-pi jump
+        heading_error = es[:, :, 2::7]                                            # [S, T, n_agents]  theta* - theta
+        heading_cost = 1 - torch.cos(heading_error)                               # [S, T, n_agents]
+
+        # running term: weighted by closeness to the goal (soft mask, no hard cut-off that could be dodged)
+        position_error = es.reshape(es.shape[0], es.shape[1], self.n_agents, 7)[..., 0:2]
+        distance_to_goal = torch.linalg.norm(position_error, dim=-1)              # [S, T, n_agents]
+        near_goal = torch.exp(-distance_to_goal**2 / (2 * self.heading_radius**2))   # 1 at the goal, 0.61 at r, 0.14 at 2r
+        loss_heading = self.alpha_heading * (heading_cost * near_goal).sum((1, 2)) / es.shape[1]      # [S]
+
+        # terminal term: average over the last heading_final_steps steps, summed over cars
+        final_cost = heading_cost[:, -self.heading_final_steps:, :]               # [S, K, n_agents]
+        loss_heading_final = self.alpha_heading_final * final_cost.sum(-1).mean(-1)                  # [S]
+
+        loss_heading = loss_heading.reshape(-1, 1, 1)
+        loss_heading_final = loss_heading_final.reshape(-1, 1, 1)
+
+        # terminal offset: the rPB must have let go of the car by the end of the rollout,
+        # so the pose the terminal terms see is the pose the car keeps afterwards
+        final_offset = us[:, -self.heading_final_steps:, :]                      # [S, K, 2*n_agents]  dxref
+        loss_offset_final = self.alpha_offset_final * (final_offset**2).sum(-1).mean(-1)   # [S]
+        loss_offset_final = loss_offset_final.reshape(-1, 1, 1)
 
         loss_bounds = self.alpha_bounds * self.f_loss_bounds(x_batch)
         
@@ -117,8 +150,24 @@ class BumpercarLoss(LQLossFH):
             loss_obst = 0
         else:
             loss_obst = self.alpha_obst * self.f_loss_obst(x_batch) # shape = (S, 1, 1)
+        # individual terms of this call, averaged over the samples (for logging only)
+        def sample_mean(term):
+            return term.detach().mean().item() if torch.is_tensor(term) else float(term)
+        self.last_terms = {
+            "track": sample_mean(loss_x),
+            "final_pos": sample_mean(loss_x_final),
+            "speed": sample_mean(loss_speed),
+            "effort": sample_mean(loss_u),
+            "col": sample_mean(loss_ca),
+            "obst": sample_mean(loss_obst),
+            "heading": sample_mean(loss_heading),
+            "heading_final": sample_mean(loss_heading_final),
+            "offset_final": sample_mean(loss_offset_final),
+        }
+
         # sum up all losses
-        loss_val = loss_x + loss_x_final + loss_u + loss_ca + loss_obst + loss_speed + loss_bounds          # shape = (S, 1, 1)
+        loss_val = (loss_x + loss_x_final + loss_u + loss_ca + loss_obst + loss_speed + loss_bounds
+                    + loss_heading + loss_heading_final + loss_offset_final)          # shape = (S, 1, 1)
         # bound
         if self.sat_bound is not None:
             loss_val = torch.tanh(loss_val/self.sat_bound)  # shape = (S, 1, 1)
@@ -172,18 +221,20 @@ class BumpercarLoss(LQLossFH):
         Return:
             - obstacle avoidance loss of shape (1, 1).
         """
-        qx = x_batched[:, :, 0::7, :]   # x of all agents. shape = (S, T, n_agents, 1)
-        qy = x_batched[:, :, 1::7, :]   # y of all agents. shape = (S, T, n_agents, 1)
-        # batched over all samples and all times of [x agent 1, y agent 1, ..., x agent n, y agent n]
-        q = torch.cat((qx,qy), dim=-1).view(x_batched.shape[0], x_batched.shape[1], 1,-1).squeeze(dim=2)    # shape = (S, T, 2*n_agents)
-        # sum up loss due to each obstacle #TODO
-        for ind, (center, cov) in enumerate(zip(self.obstacle_centers, self.obstacle_covs)):
-            if ind == 0:
-                loss_obst = normpdf(q, mu=center, cov=cov)   # shape = (S, T)
-            else:
-                loss_obst += normpdf(q, mu=center, cov=cov)  # shape = (S, T)
+        S, T = x_batched.shape[0], x_batched.shape[1]
+        position = x_batched[:, :, :, 0].reshape(S, T, self.n_agents, 7)[..., 0:2]   # (x, y) per car. shape = (S, T, n_agents, 2)
+        # sum up loss due to each obstacle, per car
+        loss_obst = torch.zeros(S, T, device=x_batched.device)
+        for center, cov in zip(self.obstacle_centers, self.obstacle_covs):
+            gaussian = normpdf(position, mu=center, cov=cov)                  # shape = (S, T, n_agents)
+            if self.obst_safe_dist is not None:
+                # Gaussian minus its value at obst_safe_dist from the center: 0 (no gradient) beyond obst_safe_dist
+                position_at_safe = center + torch.tensor([[self.obst_safe_dist, 0.0]], device=center.device)
+                gaussian_at_safe = normpdf(position_at_safe, mu=center, cov=cov)   # shape = (1)
+                gaussian = torch.relu(gaussian - gaussian_at_safe)
+            loss_obst = loss_obst + gaussian.sum(-1)                          # shape = (S, T)
         # average over time steps
-        loss_obst = loss_obst.sum(1) / loss_obst.shape[1]    # shape = (S)
+        loss_obst = loss_obst.sum(1) / T    # shape = (S)
         return loss_obst.reshape(-1, 1, 1)
 
     def f_loss_ca(self, x_batch):
@@ -201,15 +252,17 @@ class BumpercarLoss(LQLossFH):
         min_sec_dist = self.min_dist + 0.2
         # compute pairwise distances
         distance_sq = self.get_pairwise_distance_sq(x_batch)              # shape = (S, T, n_agents, n_agents)
-        # compute and sum up loss when two agents are too close
-        loss_ca = (1/(distance_sq + 1e-3) * (distance_sq.detach() < (min_sec_dist ** 2)) * self.mask).sum((-1, -2))/2        # shape = (S, T)
+        # 1/d^2 minus its value at the safety distance: continuous, and 0 (no gradient) beyond min_sec_dist
+        inverse_distance_sq = 1 / (distance_sq + 1e-3)                    # shape = (S, T, n_agents, n_agents)
+        inverse_distance_sq_at_safe = 1 / (min_sec_dist ** 2 + 1e-3)
+        loss_ca = (torch.relu(inverse_distance_sq - inverse_distance_sq_at_safe) * self.mask).sum((-1, -2))/2        # shape = (S, T)
         # average over time steps
         loss_ca = loss_ca.sum(1)/loss_ca.shape[1]
         # reshape to S,1,1
         loss_ca = loss_ca.reshape(-1,1,1)
         return loss_ca
 
-    def count_collisions(self, x_batch):
+    def count_collisions(self, x_batch, min_dist=None):
         """
         Count the number of collisions between agents.
 
@@ -223,7 +276,8 @@ class BumpercarLoss(LQLossFH):
         if len(x_batch.shape) == 3:
             x_batch = x_batch.reshape(*x_batch.shape, 1)
         distance_sq = self.get_pairwise_distance_sq(x_batch)  # shape = (S, T, n_agents, n_agents)
-        col_matrix = (0.0001 < distance_sq) * (distance_sq < self.min_dist ** 2)  # Boolean collision matrix of shape (S, T, n_agents, n_agents)
+        min_dist = self.min_dist if min_dist is None else min_dist   # evaluation may use its own safety distance
+        col_matrix = (0.0001 < distance_sq) * (distance_sq < min_dist ** 2)  # Boolean collision matrix of shape (S, T, n_agents, n_agents)
         n_coll = col_matrix.sum().item()    # all collisions at all times and across all rollouts
         return n_coll/2                     # each collision is counted twice
 
@@ -248,29 +302,21 @@ class BumpercarLoss(LQLossFH):
         return distance_sq
 
 
-def normpdf(q, mu, cov):  #TODO
+def normpdf(q, mu, cov):
     """
-    PDF of normal distribution with mean "mu" and covariance "cov".
+    PDF of a 2D normal distribution with mean "mu" and diagonal covariance "cov", at each position.
 
     Args:
-        - q: shape(S, T, state_dim_per_agent)
-        - mu:
-        - cov:
+        - q: positions (x, y). shape = (..., 2)
+        - mu: mean. shape = (1, 2)
+        - cov: diagonal of the covariance matrix. shape = (1, 2)
 
     Return:
-            -
+        - density at each position. shape = (...)
     """
     d = 2
     mu = mu.view(1, d)
-    cov = cov.view(1, d)  # the diagonal of the covariance matrix
-    qs = torch.split(q, 2, dim=-1)
-    for ind, qi in enumerate(qs):
-        # if qi[1]<1.5 and qi[1]>-1.5:
-        den = (2*torch.pi)**(0.5*d) * torch.sqrt(torch.prod(cov))
-        nom = torch.exp((-0.5 * (qi - mu)**2 / cov).sum(-1))
-        # out = out + num/den
-        if ind == 0:
-            out = nom/den
-        else:
-            out += nom/den
-    return out
+    cov = cov.view(1, d)
+    den = (2*torch.pi)**(0.5*d) * torch.sqrt(torch.prod(cov))
+    nom = torch.exp((-0.5 * (q - mu)**2 / cov).sum(-1))
+    return nom/den

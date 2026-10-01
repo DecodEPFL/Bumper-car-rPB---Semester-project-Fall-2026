@@ -10,11 +10,12 @@ class BumpercarDataset(CostumDataset):
         y_final_limit,
         x0,
         x_final,
-        std_init_theta,
+        start_heading_range,
         car_init_radius=1.0,
         final_car_radius=1.0,
         final_car_min_dist=2,
         n_agents=2,
+        goal_heading_range=0.0,
     ):
         exp_name = 'bumpercar'
         file_name = 'data_T'+str(horizon)+'_stdini'+str(car_init_radius)+'_agents'+str(n_agents)+'_RS'+str(random_seed)+'.pkl'
@@ -30,7 +31,8 @@ class BumpercarDataset(CostumDataset):
         self.y_final_limit = y_final_limit
         self.final_car_min_dist = final_car_min_dist
         self.final_car_radius = final_car_radius
-        self.std_init_theta = std_init_theta
+        self.start_heading_range = start_heading_range  # [rad] half-width of the start heading spread
+        self.goal_heading_range = goal_heading_range    # [rad] half-width of the target heading spread; 0 = off
 
     def sample_uniform_disk(self, radius, device):
         angle = 2.0 * torch.pi * torch.rand((), device=device)
@@ -81,11 +83,15 @@ class BumpercarDataset(CostumDataset):
                     self.car_init_radius,
                     self.x0.device,
                 )
-                noise[base + 2] = self.std_init_theta * torch.rand(())
+                noise[base + 2] = self.start_heading_range * (2 * torch.rand(()) - 1)    # symmetric: U(-range, range)
                 x_final_sample[base:base + 2] += self.sample_uniform_disk(
                     self.final_car_radius,
                     self.x_final.device,
                 )
+                # target heading: scenario heading + U(-range, range), wrapped to (-pi, pi]
+                if self.goal_heading_range > 0:     # no random draw when off, so existing datasets stay identical
+                    heading = x_final_sample[base + 2] + self.goal_heading_range * (2 * torch.rand(()) - 1)
+                    x_final_sample[base + 2] = torch.atan2(torch.sin(heading), torch.cos(heading))
 
             x0_sample = x0_sample + noise
             data[rollout_num, 0, :state_dim_x0] = x0_sample
