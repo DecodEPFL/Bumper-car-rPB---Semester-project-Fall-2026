@@ -302,9 +302,10 @@ class BumpercarSystem(nn.Module):
         w = torch.zeros_like(data[:, :, :nx])
 
 
-        # dataset stores x-y references:
+        # dataset stores the full 7-state reference per car:
         ref = data[:, :, nx:nx + nx]
-        xbar = ref[:, :, self.pos_indices()]
+        xbar = ref[:, :, self.pos_indices()]                    # (x, y) per car: P-controller target
+        theta_ref = ref[:, :, 2::self.agent_state_dim]          # target heading per car: only for the controller's M2
 
         for t in range(data.shape[1]):
             x, v = self.forward(
@@ -316,7 +317,7 @@ class BumpercarSystem(nn.Module):
                 xbar=xbar[:, t:t + 1, :],
             )
 
-            u = controller(x, v, xbar[:, t:t + 1, :])
+            u = controller(x, v, xbar[:, t:t + 1, :], theta_ref[:, t:t + 1, :])
 
             e = ref[:, t:t + 1, :] - x
 

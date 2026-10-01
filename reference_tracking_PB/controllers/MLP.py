@@ -34,5 +34,5 @@ class ZeroController(torch.nn.Module):
     def reset(self):
         pass
 
-    def forward(self, x, v, xbar):
+    def forward(self, x, v, xbar, theta_ref=None):
         return torch.zeros_like(xbar)

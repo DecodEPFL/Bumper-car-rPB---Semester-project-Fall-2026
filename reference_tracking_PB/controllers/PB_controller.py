@@ -30,6 +30,7 @@ class PerfBoostController(nn.Module):
         ren_internal_state_init=None,
         # misc
         output_amplification: float=20,
+        heading_encoding: bool = False,
     ):
         """
          Args:
@@ -44,6 +45,8 @@ class PerfBoostController(nn.Module):
             epsilon (float, optional): Positive and negligible scalar to force positive definite matrices.
             contraction_rate_lb (float, optional): Lower bound on the contraction rate. Defaults to 1.
             ren_internal_state_init (torch.Tensor, optional): initial state of the REN. Defaults to 0 when None.
+            heading_encoding (bool): if True, each car's heading entry of w_hat is replaced by
+                (sin, 1 - cos) before the REN and the MLP (8 instead of 7 inputs per car).
         """
         super().__init__()
 
@@ -63,17 +66,21 @@ class PerfBoostController(nn.Module):
         # set dimensions
         self.dim_in = self.input_init.shape[-1]
         self.dim_out = self.output_init.shape[-1]
+        self.n_agents = self.dim_in // 7
+        self.heading_encoding = heading_encoding
+        # size of the networks' input w_in: 7 per car, or 8 with (sin theta, 1 - cos theta) instead of theta
+        self.dim_w_in = (8 if heading_encoding else 7) * self.n_agents
 
         # define the REN
         self.c_ren = ContractiveREN(
-            dim_in=self.dim_in, dim_out=self.dim_out, dim_internal=dim_internal,
+            dim_in=self.dim_w_in, dim_out=self.dim_out, dim_internal=dim_internal,
             dim_nl=dim_nl, initialization_std=initialization_std,
             internal_state_init=ren_internal_state_init,
             posdef_tol=posdef_tol, contraction_rate_lb=contraction_rate_lb
         ).to(device)
 
-        # input: [w_hat (full state), xbar (goal x, y per car)] -> 18 for 2 cars
-        self.MLP = MLP(dim_in=self.dim_in + self.dim_out, dim_out=self.dim_out)
+        # input: [w_in, goal (x, y) per car, target heading (sin, 1 - cos) per car]
+        self.MLP = MLP(dim_in=self.dim_w_in + self.dim_out + 2 * self.n_agents, dim_out=self.dim_out)
 
         # define the system dynamics without process noise
         self.noiseless_forward = noiseless_forward
@@ -92,38 +99,51 @@ class PerfBoostController(nn.Module):
 
         self.c_ren.x = self.c_ren.init_x    # reset the REN state to the initial value
 
-    def forward(self, input_t: torch.Tensor,vg:torch.Tensor,xbar:torch.Tensor,):
+    def forward(self, input_t: torch.Tensor, vg: torch.Tensor, xbar: torch.Tensor, theta_ref: torch.Tensor):
         """
         Forward pass of the controller.
 
         Args:
             input_t (torch.Tensor): Input with the size of (batch_size, 1, self.dim_in).
             NOTE: when used in closed-loop, "input_t" is the measured states.
+            xbar (torch.Tensor): goal (x, y) per car, (batch_size, 1, 2*n_agents).
+            theta_ref (torch.Tensor): target heading per car, (batch_size, 1, n_agents).
 
         Return:
             y_out (torch.Tensor): Output with (batch_size, 1, self.dim_out).
         """
 
 
-        # apply noiseless forward to get noise less input (noise less state of the plant)
-        u_noiseless, _ = self.noiseless_forward(
+        batch_size = input_t.shape[0]
+
+        # 1) internal model: predicted state from the previous state, input and reference
+        x_predicted, _ = self.noiseless_forward(
             t=self.t,
-            x=self.last_input,  # last input to the controller is the last state of the plant
-            u=self.last_output, 
+            x=self.last_input,    # last input to the controller is the last state of the plant
+            u=self.last_output,   # last output of the controller is the last input to the plant
             v=self.last_vg,
-            xbar = self.last_xbar  # last output of the controller is the last input to the plant
-        )  # shape = (self.batch_size, 1, self.dim_in)
+            xbar=self.last_xbar,
+        )                                                                     # [B, 1, 7*n_agents]
 
-        # reconstruct the noise
-        w_ = input_t - u_noiseless # shape = (self.batch_size, 1, self.dim_in)
+        # 2) reconstructed disturbance: measured state minus predicted state
+        w_hat = input_t - x_predicted                                         # [B, 1, 7*n_agents]
 
-        # apply REN
-        output_REN = self.c_ren.forward(w_)
-        mlp_input = torch.cat((w_, xbar), dim=2)
-        mlp_input = mlp_input.view(input_t.shape[0],1, -1)
-   
+        # 3) controller input: per car, replace the heading entry theta by (sin theta, 1 - cos theta)
+        #    -> continuous across +-pi, and still 0 when w_hat = 0 (keeps the l_p property)
+        if self.heading_encoding:
+            w_hat_per_car = w_hat.view(batch_size, 1, self.n_agents, 7)      # [x, y, theta, v_f, beta_f, beta_r, delta]
+            position = w_hat_per_car[..., 0:2]
+            theta = w_hat_per_car[..., 2:3]
+            rest = w_hat_per_car[..., 3:7]                                    # v_f, beta_f, beta_r, delta
+            w_in = torch.cat((position, torch.sin(theta), 1 - torch.cos(theta), rest), dim=-1)
+            w_in = w_in.view(batch_size, 1, 8 * self.n_agents)
+        else:
+            w_in = w_hat
 
-        # apply MLP on reference plus disturbance 
+        # 4) M1 (REN) on w_in; M2 (MLP) on w_in, the goal (x, y) and the target heading
+        #    as (sin theta*, 1 - cos theta*) per car. theta* is not given to the REN: it does not vanish, so it would break l_p
+        output_REN = self.c_ren.forward(w_in)
+        mlp_input = torch.cat((w_in, xbar, torch.sin(theta_ref), 1 - torch.cos(theta_ref)), dim=2).view(batch_size, 1, -1)
         output_MLP = self.MLP.forward(mlp_input)
 
         output = output_REN*output_MLP*self.output_amplification   # shape = (self.batch_size, 1, self.dim_out)
