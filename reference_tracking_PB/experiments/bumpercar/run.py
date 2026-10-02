@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(1, BASE_DIR)
 
-from experiment_params import getCarFinalParams, getCarInitParams, getLossParams, getExtraLossParams, SCENARIOS, OBSTACLES
+from experiment_params import getCarFinalParams, getCarInitParams, getLossParams, getExtraLossParams, getGoalSequence, SCENARIOS, OBSTACLES
 from controllers.MLP import ZeroController
 from config import device
 from arg_parser import argument_parser, print_args
@@ -75,6 +75,7 @@ def main():
         start_heading_range=start_heading_range,
         n_agents=n_agents,
         goal_heading_range=args.goal_heading_range * torch.pi / 180,
+        goals=getGoalSequence(),                # from SCENARIOS: one goal, or several visited in order
     )
     
 # divide to train and test
@@ -114,10 +115,9 @@ def main():
     initialization_std=args.cont_init_std,
     output_amplification=1,
     ren_internal_state_init=None,
-    heading_encoding=args.heading_encoding,
     clock_tau=args.ren_clock_tau,
     dt=sys.dt,
-    ref_change_input=args.ren_ref_change,
+    ref_trace_tau=args.ren_ref_trace_tau,
 ).to(device)
 
     if args.load_controller is not None:
@@ -174,6 +174,8 @@ def main():
         position_deadzone=position_deadzone,
         steady_state_velocity_radius=steady_state_velocity_radius,
         **getExtraLossParams(),
+        goal_leg_ends=dataset.goal_leg_ends,    # final position / heading at the end of every goal's leg
+        final_leg_start=dataset.final_leg_start,
     )
  
 # ------------ 5. Optimizer ------------
@@ -195,26 +197,15 @@ def main():
     grad_clip = args.grad_clip if args.grad_clip is not None else float("inf")
 
 # ------------ 6. Training ------------
-# baseline: P-controller only (no rPB correction), from the nominal start to the nominal goal
-    logger.info("Plotting closed-loop trajectory with the P-controller only...")
-    data_pid = torch.zeros(1, args.horizon + 200, 2 * nx, device=device)
-    data_pid[:, 0, :nx] = dataset.x0.to(device)
-    data_pid[:, :, nx:] = x_final_bumpercar.to(device)
+# closed-loop trajectory before training, with the P-controller only (no rPB correction) on the same sample overlaid
+    logger.info('Plotting closed-loop trajectory before training the controller (with the P-controller only)...')
     pid_only_ctl = ZeroController(ref_dim=2 * n_agents).to(device)
     with torch.no_grad():
-        x_pid, _, _ = sys.rollout(pid_only_ctl, data_pid)
-    plot_closed_loop(
-        x_pid[0], data_pid[0, 0, nx:], save_folder, 'CL_P_only.pdf',
-        'P-controller only (no rPB)', loss_fn, data_pid.shape[1],
-    )
-
-# closed-loop trajectory before training the controller
-    logger.info('Plotting closed-loop trajectory before training the controller...')
-    with torch.no_grad():
+        x_pid, _, _ = sys.rollout(pid_only_ctl, plot_data[:1])
         x_log, _, u_log = sys.rollout(ctl, plot_data[:1])
     plot_closed_loop(
-        x_log[0], plot_data[0, 0, nx:], save_folder, 'CL_untrained.pdf',
-        'rPB - untrained controller', loss_fn, t_ext,
+        x_log[0], plot_data[0, :, nx:], save_folder, 'CL_untrained.pdf',
+        'rPB - untrained controller vs P-controller only', loss_fn, t_ext, x_baseline=x_pid[0],
     )
 
     logger.info('\n------------ Begin training ------------')
@@ -343,18 +334,21 @@ def main():
     with torch.no_grad():
         x_log, _, u_log = sys.rollout(ctl, plot_data[:1])
     plot_closed_loop(
-        x_log[0], plot_data[0, 0, nx:], save_folder, 'CL_trained.pdf',
+        x_log[0], plot_data[0, :, nx:], save_folder, 'CL_trained.pdf',
         'rPB - trained controller', loss_fn, t_ext,
     )
     plot_dxref_over_time(u_log[0], sys.dt, n_agents, save_folder, 'U_over_time.pdf')
 
 
-def plot_closed_loop(x, xbar, save_folder, filename, text, loss_fn, T):
-    """Plot one closed-loop rollout x [T, 7*n_agents] with goal xbar [7*n_agents] and the obstacles."""
+def plot_closed_loop(x, ref, save_folder, filename, text, loss_fn, T, x_baseline=None):
+    """Plot one closed-loop rollout x [T, 7*n_agents] with its route (reference over time ref [T, 7*n_agents]:
+    every goal as a numbered star), the obstacles and optionally a baseline rollout on the same sample."""
+    earlier_goals, goal = route_points(ref)
     plot_trajectories(
-        x, xbar=xbar, n_agents=loss_fn.n_agents, save_folder=save_folder,
+        x, xbar=goal, n_agents=loss_fn.n_agents, save_folder=save_folder,
         filename=filename, text=text, T=T,
         obstacle_centers=loss_fn.obstacle_centers, obstacle_covs=loss_fn.obstacle_covs,
+        earlier_goals=earlier_goals, x_baseline=x_baseline,
     )
 
 

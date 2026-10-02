@@ -16,6 +16,8 @@ class BumpercarDataset(CostumDataset):
         final_car_min_dist=2,
         n_agents=2,
         goal_heading_range=0.0,
+        goals=None,
+        leg_steps=None,
     ):
         exp_name = 'bumpercar'
         file_name = 'data_T'+str(horizon)+'_stdini'+str(car_init_radius)+'_agents'+str(n_agents)+'_RS'+str(random_seed)+'.pkl'
@@ -33,6 +35,21 @@ class BumpercarDataset(CostumDataset):
         self.final_car_radius = final_car_radius
         self.start_heading_range = start_heading_range  # [rad] half-width of the start heading spread
         self.goal_heading_range = goal_heading_range    # [rad] half-width of the target heading spread; 0 = off
+        # goals visited in order (one flat 7*n_agents state each; default: the single goal x_final), one leg each
+        self.goals = list(goals) if goals is not None else [x_final]
+        self.leg_starts, self.goal_leg_ends, self.final_leg_start = self.goal_schedule(horizon, len(self.goals), leg_steps)
+
+    @staticmethod
+    def goal_schedule(horizon, n_goals, leg_steps=None):
+        """
+        Time-based switching between the goals: every goal but the last has a leg of leg_steps steps
+        (default: equal legs, horizon // n_goals); the last goal takes the rest of the horizon.
+        Returns the first step of each leg, the last step of each leg and the first step of the last leg.
+        """
+        leg_steps = horizon // n_goals if leg_steps is None else leg_steps
+        leg_starts = [k * leg_steps for k in range(n_goals)]
+        goal_leg_ends = [start - 1 for start in leg_starts[1:]] + [horizon - 1]
+        return leg_starts, goal_leg_ends, leg_starts[-1]
 
     def sample_uniform_disk(self, radius, device):
         angle = 2.0 * torch.pi * torch.rand((), device=device)
@@ -75,8 +92,8 @@ class BumpercarDataset(CostumDataset):
         for rollout_num in range(num_samples):
             x0_sample = self.x0.clone()
             noise = torch.zeros_like(self.x0)
-            x_final_sample = self.x_final.clone()
-            
+            goal_samples = [goal.clone() for goal in self.goals]
+
             for i in range(self.n_agents):
                 base = 7 * i
                 noise[base:base + 2] = self.sample_uniform_disk(
@@ -84,18 +101,24 @@ class BumpercarDataset(CostumDataset):
                     self.x0.device,
                 )
                 noise[base + 2] = self.start_heading_range * (2 * torch.rand(()) - 1)    # symmetric: U(-range, range)
-                x_final_sample[base:base + 2] += self.sample_uniform_disk(
-                    self.final_car_radius,
-                    self.x_final.device,
-                )
-                # target heading: scenario heading + U(-range, range), wrapped to (-pi, pi]
-                if self.goal_heading_range > 0:     # no random draw when off, so existing datasets stay identical
-                    heading = x_final_sample[base + 2] + self.goal_heading_range * (2 * torch.rand(()) - 1)
-                    x_final_sample[base + 2] = torch.atan2(torch.sin(heading), torch.cos(heading))
+                # every goal: its own random position offset, and its own target-heading offset if enabled
+                for goal_sample in goal_samples:
+                    goal_sample[base:base + 2] += self.sample_uniform_disk(
+                        self.final_car_radius,
+                        self.x0.device,
+                    )
+                    # target heading: scenario heading + U(-range, range), wrapped to (-pi, pi]
+                    if self.goal_heading_range > 0:     # no random draw when off, so existing datasets stay identical
+                        heading = goal_sample[base + 2] + self.goal_heading_range * (2 * torch.rand(()) - 1)
+                        goal_sample[base + 2] = torch.atan2(torch.sin(heading), torch.cos(heading))
 
             x0_sample = x0_sample + noise
             data[rollout_num, 0, :state_dim_x0] = x0_sample
-            data[rollout_num, :, state_dim_x0:] = x_final_sample.view(1, -1)
+
+            # reference: the goals in visiting order, each during its leg (the last goal until the end of the horizon)
+            leg_ends = self.leg_starts[1:] + [self.horizon]
+            for goal_sample, start, end in zip(goal_samples, self.leg_starts, leg_ends):
+                data[rollout_num, start:end, state_dim_x0:] = goal_sample.view(1, -1)
 
         assert data.shape[0] == num_samples
         return data

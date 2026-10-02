@@ -13,14 +13,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(1, BASE_DIR)
 
 import experiment_params
-from experiment_params import getCarFinalParams, getCarInitParams, getLossParams, getExtraLossParams, n_agents as N_AGENTS, args as ARGS
+from experiment_params import getCarFinalParams, getCarInitParams, getLossParams, getExtraLossParams, getGoalSequence, n_agents as N_AGENTS, args as ARGS
 from config import device
 from controllers import PerfBoostController
 from controllers.MLP import ZeroController
 from loss_functions import BumpercarLoss
 from plants import BumpercarSystem, car_params
 from plants.bumpercar.bumpercar_dataset import BumpercarDataset
-from utils.plot_functions import agent_color
+from utils.plot_functions import agent_color, route_points
 
 
 # Checkpoint to evaluate: --checkpoint <path>, default the provided one. Use a full checkpoint (with MLP weights).
@@ -29,7 +29,7 @@ TRAINED_PBR_MODEL_PATH = ARGS.checkpoint or os.path.join(BASE_DIR, "experiments/
 # Training settings of the evaluated run override sim.py's own flags: same car count, start/goal spreads,
 # loss weights and scenario as in training. Evaluation seed, horizon and violation distances stay sim.py's own.
 TRAINING_SETTINGS = ["n_agents", "start_radius", "start_heading_range", "goal_heading_range",
-                     "alpha_u", "alpha_col", "alpha_obst", "min_dist", "obst_safe_dist",
+                     "alpha_u", "q_final_factor", "alpha_col", "alpha_obst", "min_dist", "obst_safe_dist",
                      "alpha_heading", "alpha_heading_final", "heading_radius", "heading_final_steps", "alpha_offset_final"]
 checkpoint = torch.load(TRAINED_PBR_MODEL_PATH, map_location="cpu", weights_only=False)
 stored_args = checkpoint.get("args", {})
@@ -42,10 +42,13 @@ if missing:
     print(f"[WARN] checkpoint does not store {missing}; using sim.py's flags for these")
 experiment_params.n_agents = N_AGENTS = ARGS.n_agents
 if "scenario" in checkpoint:
-    experiment_params.SCENARIOS[N_AGENTS] = {"start": checkpoint["scenario"]["start"], "goal": checkpoint["scenario"]["goal"]}
+    experiment_params.SCENARIOS[N_AGENTS] = {key: value for key, value in checkpoint["scenario"].items() if key != "obstacles"}   # start, goal(s)
     experiment_params.OBSTACLES = checkpoint["scenario"]["obstacles"]
 else:
     print("[WARN] checkpoint does not store its scenario; using the current SCENARIOS and OBSTACLES")
+# goal sequence: switch between goals after the same number of steps as in training (the last goal keeps the rest
+# of the longer evaluation horizon)
+TRAIN_LEG_STEPS = stored_args.get("horizon", ARGS.horizon) // len(getGoalSequence())
 
 EVALUATE_MODEL = True
 EVAL_HORIZON = 500
@@ -109,9 +112,9 @@ def make_generated_sample_data(horizon, sample_index=0, random_seed=11, split="t
 
     data = source_data[sample_index:sample_index + 1]
     nx = data.shape[-1] // 2
-    xbar = data[0, 0, nx:]
+    ref = data[0, :, nx:]                       # reference over time: the goals in visiting order
 
-    return data.to(device), xbar.to(device)
+    return data.to(device), ref.to(device)
 
 
 def make_crossing_data(horizon, n_agents=N_AGENTS):
@@ -123,7 +126,7 @@ def make_crossing_data(horizon, n_agents=N_AGENTS):
     data[:, 0, :nx] = x0_bumpercar
     data[:, :, nx:] = x_final_bumpercar.view(1, 1, -1)
     
-    return data.to(device), x_final_bumpercar
+    return data.to(device), data[0, :, nx:].to(device)
 
 
 def make_eval_data(horizon, num_rollouts, num_test_rollouts, random_seed):
@@ -142,6 +145,8 @@ def make_eval_data(horizon, num_rollouts, num_test_rollouts, random_seed):
         start_heading_range=start_heading_range,
         n_agents=N_AGENTS,
         goal_heading_range=ARGS.goal_heading_range * torch.pi / 180,   # pass the training run's --goal-heading-range
+        goals=getGoalSequence(),                # from the checkpoint's scenario: one goal, or several in order
+        leg_steps=TRAIN_LEG_STEPS,
     )
     train_data, test_data = dataset.get_data(
         num_train_samples=num_rollouts,
@@ -152,6 +157,7 @@ def make_eval_data(horizon, num_rollouts, num_test_rollouts, random_seed):
 
 def make_loss_fn(train_data, n_agents=N_AGENTS):
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)    
+    _, goal_leg_ends, final_leg_start = BumpercarDataset.goal_schedule(train_data.shape[1], len(getGoalSequence()), TRAIN_LEG_STEPS)
     Q, Q_final, Qs, alpha_col, alpha_obst, alpha_u, position_deadzone, steady_state_velocity_radius, min_dist = getLossParams(device)
     
     return BumpercarLoss(
@@ -171,6 +177,8 @@ def make_loss_fn(train_data, n_agents=N_AGENTS):
         position_deadzone=position_deadzone,
         steady_state_velocity_radius=steady_state_velocity_radius,
         **getExtraLossParams(),
+        goal_leg_ends=goal_leg_ends,
+        final_leg_start=final_leg_start,
     )
 
 
@@ -211,10 +219,10 @@ def load_controller(system, checkpoint_path):
         initialization_std=args.get("cont_init_std", 0.1),
         output_amplification=1,
         ren_internal_state_init=None,
-        heading_encoding=args.get("heading_encoding", False),   # old checkpoints: raw heading
         clock_tau=args.get("ren_clock_tau"),
         dt=system.dt,
-        ref_change_input=args.get("ren_ref_change", False),
+        # reference trace; checkpoints from before the trace: raw reference change (tau 0) if they had it, else off
+        ref_trace_tau=args.get("ren_ref_trace_tau", 0.0 if args.get("ren_ref_change") else None),
     ).to(device)
 
     if "controller_state_dict" in checkpoint:
@@ -302,7 +310,7 @@ def simulate(horizon=400, use_generated_sample=SIM_USE_GENERATED_SAMPLE, sample_
         title = "PID only - set TRAINED_PBR_MODEL_PATH to use pRB"
 
     if use_generated_sample:
-        data, xbar = make_generated_sample_data(
+        data, ref = make_generated_sample_data(
             horizon=horizon,
             sample_index=sample_index,
             random_seed=SIM_RANDOM_SEED,
@@ -310,7 +318,7 @@ def simulate(horizon=400, use_generated_sample=SIM_USE_GENERATED_SAMPLE, sample_
         )
         title = f"{title} - {SIM_DATA_SPLIT} generated sample {sample_index}"
     else:
-        data, xbar = make_crossing_data(horizon=horizon, n_agents=system.n_agents)
+        data, ref = make_crossing_data(horizon=horizon, n_agents=system.n_agents)
         title = f"{title} - fixed crossing"
 
     with torch.no_grad():
@@ -324,7 +332,7 @@ def simulate(horizon=400, use_generated_sample=SIM_USE_GENERATED_SAMPLE, sample_
     )
     # print(f"Sim obstacle collision indices: {sim_obstacle_collision_indices}")
 
-    return x_log[0].detach().cpu(), xbar.cpu(), dxRef_log, title
+    return x_log[0].detach().cpu(), ref.cpu(), dxRef_log, title
 
 
 def evaluate_rollout_metrics(
@@ -383,6 +391,16 @@ def evaluate_rollout_metrics(
     heading_difference = target_theta - final_theta
     final_heading_error = torch.rad2deg(torch.atan2(torch.sin(heading_difference), torch.cos(heading_difference))).abs()
 
+    # goal sequence: position and heading error at the end of every earlier goal's leg (the last goal: above)
+    _, goal_leg_ends, _ = BumpercarDataset.goal_schedule(data.shape[1], len(getGoalSequence()), TRAIN_LEG_STEPS)
+    earlier_goal_position_errors, earlier_goal_heading_errors = [], []
+    for end in goal_leg_ends[:-1]:
+        position = x_log[:, end, pos_idx].reshape(num_runs, n_agents, 2)
+        goal_position = data[:, end, nx + torch.tensor(pos_idx, device=data.device)].reshape(num_runs, n_agents, 2)
+        difference = data[:, end, nx + 2::7] - x_log[:, end, 2::7]
+        earlier_goal_position_errors.append(torch.linalg.norm(position - goal_position, dim=-1))      # [runs, n_agents]
+        earlier_goal_heading_errors.append(torch.rad2deg(torch.atan2(torch.sin(difference), torch.cos(difference))).abs())
+
     rollout_horizon = x_log.shape[1]
     positions = x_log[:, :, pos_idx].reshape(num_runs, rollout_horizon, n_agents, 2)
     car_distance = closest_pair_distance(positions)                                  # [runs, T]
@@ -433,6 +451,12 @@ def evaluate_rollout_metrics(
     print(f"  Worst/highest: {format_list(heading_errors.max(dim=0).values)}")
     print(f"  Runs below 10 deg [%]: {format_list((heading_errors < 10).float().mean(dim=0) * 100)}")
 
+    for k, (position_error, heading_error) in enumerate(zip(earlier_goal_position_errors, earlier_goal_heading_errors)):
+        print(f"[SUMMARY] Goal {k + 1} of {len(goal_leg_ends)} (end of its leg, step {goal_leg_ends[k]}) per car")
+        print(f"  Position error RMSE [m]: {format_list(rmse(position_error))}, worst {format_list(position_error.max(dim=0).values)}")
+        print(f"  Heading error RMS [deg]: {format_list(rmse(heading_error))}, worst {format_list(heading_error.max(dim=0).values)}")
+        print(f"  Runs below 10 deg [%]:   {format_list((heading_error.cpu() < 10).float().mean(dim=0) * 100)}")
+
     print("[SUMMARY] Closest car-car distance [m]")
     print(f"  RMS: {format_list(rmse(metrics['closest_car_distance']))}")
     print(f"  Std: {format_list(metrics['closest_car_distance'].std(unbiased=False))}")
@@ -463,6 +487,8 @@ def evaluate_rollout_metrics(
                 ["run", "closest_car_distance"]
                 + [f"steady_state_error_car_{i + 1}" for i in range(n_agents)]
                 + [f"final_heading_error_deg_car_{i + 1}" for i in range(n_agents)]
+                + [f"goal_{k + 1}_{name}_car_{i + 1}" for k in range(len(earlier_goal_position_errors))
+                   for name in ("position_error", "heading_error_deg") for i in range(n_agents)]
                 + [f"closest_obstacle_distance_car_{i + 1}" for i in range(n_agents)]
                 + [
                     f"closest_obstacle_distance_car_{i + 1}_obstacle_{j + 1}"
@@ -482,6 +508,9 @@ def evaluate_rollout_metrics(
                     row[f"steady_state_error_car_{i + 1}"] = steady_state_error[run_idx, i].item()
                     row[f"final_heading_error_deg_car_{i + 1}"] = final_heading_error[run_idx, i].item()
                     row[f"closest_obstacle_distance_car_{i + 1}"] = closest_obstacle_distance[run_idx, i].item()
+                    for k in range(len(earlier_goal_position_errors)):
+                        row[f"goal_{k + 1}_position_error_car_{i + 1}"] = earlier_goal_position_errors[k][run_idx, i].item()
+                        row[f"goal_{k + 1}_heading_error_deg_car_{i + 1}"] = earlier_goal_heading_errors[k][run_idx, i].item()
                     for j in range(len(obstacle_centers)):
                         row[f"closest_obstacle_distance_car_{i + 1}_obstacle_{j + 1}"] = (
                             closest_obstacle_distance_by_center[run_idx, i, j].item()
@@ -559,6 +588,36 @@ def draw_obstacles(ax, obstacle_centers, obstacle_covs):
         ax.add_patch(circle)
 
 
+def draw_goals(ax, goals, car, color, star_size=12):
+    """Goals of one car (flat states, in visiting order): a star with its target-heading arrow each,
+    numbered 1, 2, ... when there are several. Returns the marker of the last goal."""
+    base = 7 * car
+    for k, goal in enumerate(goals):
+        draw_pose_arrow(ax, goal[base], goal[base + 1], goal[base + 2], color, length=0.4)
+        marker = ax.plot(goal[base], goal[base + 1], marker="*", markersize=star_size, color=color)[0]
+        if len(goals) > 1:
+            ax.annotate(str(k + 1), (float(goal[base]), float(goal[base + 1])), textcoords="offset points",
+                        xytext=(7, -10), color=color, fontsize=8, fontweight="bold")
+    return marker
+
+
+def draw_route(ax, ref, car, color, star_size=12, start=None):
+    """Route of one car in this sample (reference over time ref): every goal as a star with its target-heading arrow;
+    with start = this sample's start state, also its start-heading arrow. Returns the marker of the last goal."""
+    earlier_goals, goal = route_points(ref)
+    base = 7 * car
+    if start is not None:
+        draw_pose_arrow(ax, start[base], start[base + 1], start[base + 2], color, length=0.4)
+    return draw_goals(ax, earlier_goals + [goal], car, color, star_size)
+
+
+def route_legend():
+    """Legend note for a goal sequence: the goals are numbered in visiting order."""
+    if len(getGoalSequence()) < 2:
+        return []
+    return [Line2D([0], [0], linestyle="None", label="Goals numbered in visiting order")]
+
+
 def draw_sample_regions(ax, colors):
     x0_bumpercar, x_final, _, _, car_init_radius, _ = getCarInitParams(device)
 
@@ -585,11 +644,22 @@ def draw_sample_regions(ax, colors):
         )
         ax.add_patch(init_circle)
         ax.add_patch(final_circle)
+        for earlier_goal in getGoalSequence()[:-1]:   # earlier goals of a sequence, same spread as the last goal
+            ax.add_patch(Circle(
+                xy=(earlier_goal[base].item(), earlier_goal[base + 1].item()),
+                radius=REPORT_FINAL_RADIUS,
+                facecolor=color,
+                edgecolor=color,
+                alpha=0.05,
+                linestyle=":",
+                linewidth=1.0,
+                zorder=0,
+            ))
 
 
 def save_report_figure(path=None):
     path = path or output_file("report_trajectory.svg")
-    x_log, xbar, dx_log, _ = simulate()
+    x_log, ref, dx_log, _ = simulate()
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
     n_agents = N_AGENTS
     colors = [agent_color(i) for i in range(n_agents)]
@@ -610,19 +680,21 @@ def save_report_figure(path=None):
         color = colors[i]
         ax.plot(x_log[:, base], x_log[:, base + 1], color=color, linewidth=2.0, linestyle="--")
         ax.plot(x_log[0, base], x_log[0, base + 1], marker="o", markersize=6, color=color, fillstyle="none")
-        ax.plot(xbar[base], xbar[base + 1], marker="*", markersize=12, color=color)
+        draw_route(ax, ref, i, color, star_size=12, start=x_log[0])
         draw_car(ax, x_log[-1, base], x_log[-1, base + 1], x_log[-1, base + 2], color)
         draw_pose_arrow(ax, x_log[-1, base], x_log[-1, base + 1], x_log[-1, base + 2], color)
 
     legend_handles = [
         Line2D([0], [0], color="0.25", linewidth=2.0, linestyle="--", label="Trajectory"),
-        Line2D([0], [0], marker="o", color="0.25", linestyle="None", markersize=7, fillstyle="none", label="Initial position"),
-        Line2D([0], [0], marker="*", color="0.25", linestyle="None", markersize=12, label="Final target"),
-        Line2D([0], [0], marker="o", color="0.25", linestyle="None", markersize=13, fillstyle="none", label="Sample region"),
+        Line2D([0], [0], marker="o", color="0.25", linestyle="None", markersize=7, fillstyle="none", label="Start (this sample)"),
+        Line2D([0], [0], marker=r"$\rightarrow$", color="0.25", linestyle="None", markersize=12, label="Heading (start / target)"),
+        Line2D([0], [0], marker="*", color="0.25", linestyle="None", markersize=12, label="Goal (this sample)"),
+        *route_legend(),
+        Line2D([0], [0], marker="o", color="0.25", linestyle="None", markersize=13, fillstyle="none", label="Sampling region (nominal ± spread)"),
     ]
     ax.legend(
         handles=legend_handles,
-        loc="upper right",
+        loc="upper left", bbox_to_anchor=(1.02, 1.0),   # outside the axes: never covers goals or trajectories
         frameon=True,
         framealpha=0.95,
         fontsize=8,
@@ -643,7 +715,7 @@ def save_report_figure(path=None):
 
 def save_snapshot_report_figure(path=None):
     path = path or output_file("report_snapshots.svg")
-    x_log, xbar, dx_log, _ = simulate()
+    x_log, ref, dx_log, _ = simulate()
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
     n_agents = N_AGENTS
     colors = [agent_color(i) for i in range(n_agents)]
@@ -667,7 +739,7 @@ def save_snapshot_report_figure(path=None):
         color = colors[i]
         ax.plot(x_log[:, base], x_log[:, base + 1], color=color, linewidth=1.8, linestyle="--", alpha=0.45)
         ax.plot(x_log[0, base], x_log[0, base + 1], marker="o", markersize=6, color=color, fillstyle="none")
-        ax.plot(xbar[base], xbar[base + 1], marker="*", markersize=12, color=color)
+        draw_route(ax, ref, i, color, star_size=12, start=x_log[0])
 
         for snapshot_idx, label, alpha in zip(snapshot_idxs, snapshot_labels, snapshot_alphas):
             x = x_log[snapshot_idx, base]
@@ -696,13 +768,15 @@ def save_snapshot_report_figure(path=None):
 
     legend_handles = [
         Line2D([0], [0], color="0.25", linewidth=1.8, linestyle="--", label="Trajectory"),
-        Line2D([0], [0], marker="o", color="0.25", linestyle="None", markersize=7, fillstyle="none", label="Initial position"),
-        Line2D([0], [0], marker="*", color="0.25", linestyle="None", markersize=12, label="Final target"),
+        Line2D([0], [0], marker="o", color="0.25", linestyle="None", markersize=7, fillstyle="none", label="Start (this sample)"),
+        Line2D([0], [0], marker=r"$\rightarrow$", color="0.25", linestyle="None", markersize=12, label="Heading (start / target)"),
+        Line2D([0], [0], marker="*", color="0.25", linestyle="None", markersize=12, label="Goal (this sample)"),
+        *route_legend(),
         Line2D([0], [0], marker="s", color="0.25", linestyle="None", markersize=8, alpha=0.70, label="Snapshots 1-5"),
     ]
     ax.legend(
         handles=legend_handles,
-        loc="upper right",
+        loc="upper left", bbox_to_anchor=(1.02, 1.0),   # outside the axes: never covers goals or trajectories
         frameon=True,
         framealpha=0.95,
         fontsize=8,
@@ -792,13 +866,13 @@ def save_collision_report_figure(path=None):
         )
 
     legend_handles = [
-        Line2D([0], [0], color="0.25", linewidth=2.0, linestyle="--", label="Trajectory"),
-        Line2D([0], [0], marker="o", color="0.25", linestyle="None", markersize=7, fillstyle="none", label="Initial position"),
-        Line2D([0], [0], marker="*", color="0.25", linestyle="None", markersize=12, label="Final target"),
+        Line2D([0], [0], color="0.25", linewidth=2.0, linestyle="--", label="Straight path (illustration)"),
+        Line2D([0], [0], marker="o", color="0.25", linestyle="None", markersize=7, fillstyle="none", label="Start (nominal)"),
+        Line2D([0], [0], marker="*", color="0.25", linestyle="None", markersize=12, label="Goal (nominal)"),
         Line2D([0], [0], marker="o", color="tab:red", linestyle="None", markersize=13, fillstyle="none", label="1 m safety radius"),
         Line2D([0], [0], color="tab:red", linewidth=6, alpha=0.45, label="Collision overlap"),
     ]
-    ax.legend(handles=legend_handles, loc="upper right", frameon=True, framealpha=0.95)
+    ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=True, framealpha=0.95)   # outside the axes
 
     output_dir = os.path.dirname(path)
     if output_dir:
@@ -810,7 +884,10 @@ def save_collision_report_figure(path=None):
 
 def save_init_report_figure(path=None):
     path = path or output_file("report_setup.svg")
-    x0_bumpercar, x_final, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
+    # the scenario as designed: nominal start and goal(s) (poses with heading arrows),
+    # and the sampling regions around them; the rollout figures show the poses of their own sample
+    start, goal, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
+    goals = getGoalSequence()
     n_agents = N_AGENTS
     colors = [agent_color(i) for i in range(n_agents)]
 
@@ -828,42 +905,21 @@ def save_init_report_figure(path=None):
     for i in range(n_agents):
         base = 7 * i
         color = colors[i]
-        ax.plot(
-            x0_bumpercar[base],
-            x0_bumpercar[base + 1],
-            marker="o",
-            markersize=7,
-            color=color,
-            fillstyle="none",
-        )
-        ax.plot(
-            x_final[base],
-            x_final[base + 1],
-            marker="*",
-            markersize=13,
-            color=color,
-        )
-        draw_car(
-            ax,
-            x0_bumpercar[base],
-            x0_bumpercar[base + 1],
-            x0_bumpercar[base + 2],
-            color,
-        )
-        draw_pose_arrow(
-            ax,
-            x0_bumpercar[base],
-            x0_bumpercar[base + 1],
-            x0_bumpercar[base + 2],
-            color,
-        )
+        # start: car and heading arrow at the nominal start pose
+        ax.plot(start[base], start[base + 1], marker="o", markersize=7, color=color, fillstyle="none")
+        draw_car(ax, start[base], start[base + 1], start[base + 2], color)
+        draw_pose_arrow(ax, start[base], start[base + 1], start[base + 2], color)
+        # goals: star and target-heading arrow at the nominal poses (numbered for a goal sequence)
+        draw_goals(ax, goals, i, color, star_size=13)
 
     legend_handles = [
-        Line2D([0], [0], marker="o", color="0.25", linestyle="None", markersize=7, fillstyle="none", label="Initial position"),
-        Line2D([0], [0], marker="*", color="0.25", linestyle="None", markersize=12, label="Final target"),
-        Line2D([0], [0], marker="o", color="0.25", linestyle="None", markersize=13, fillstyle="none", label="Sample region"),
+        Line2D([0], [0], marker="o", color="0.25", linestyle="None", markersize=7, fillstyle="none", label="Start (nominal)"),
+        Line2D([0], [0], marker="*", color="0.25", linestyle="None", markersize=12, label="Goal (nominal)"),
+        *route_legend(),
+        Line2D([0], [0], marker=r"$\rightarrow$", color="0.25", linestyle="None", markersize=12, label="Heading (nominal start / target)"),
+        Line2D([0], [0], marker="o", color="0.25", linestyle="None", markersize=13, fillstyle="none", label="Sampling region (nominal ± spread)"),
     ]
-    ax.legend(handles=legend_handles, loc="upper right", frameon=True, framealpha=0.95)
+    ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=True, framealpha=0.95)   # outside the axes
 
     output_dir = os.path.dirname(path)
     if output_dir:
@@ -875,7 +931,7 @@ def save_init_report_figure(path=None):
 
 def save_trajectory_gif(path=None, frame_stride=4, fps=20):
     path = path or output_file("trajectory.gif")
-    x_log, xbar, dx_log, title = simulate()
+    x_log, ref, dx_log, title = simulate()
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
     min_dist = EVAL_MIN_DIST
     n_agents = N_AGENTS
@@ -916,7 +972,7 @@ def save_trajectory_gif(path=None, frame_stride=4, fps=20):
         )
         ax.add_patch(safety_circle)
         safety_patches.append(safety_circle)
-        ax.plot(xbar[base], xbar[base + 1], marker="*", markersize=14, color=color)
+        draw_route(ax, ref, i, color, star_size=14, start=x_log[0])
         ax.plot(x_log[0, base], x_log[0, base + 1], marker="o", markersize=7, color=color, fillstyle="none")
 
     def update(frame):
@@ -960,7 +1016,7 @@ def save_trajectory_gif(path=None, frame_stride=4, fps=20):
 
 
 def show_simulation():
-    x_log, xbar, dx_log, title = simulate()
+    x_log, ref, dx_log, title = simulate()
     _, _, obstacle_centers, obstacle_covs, _, _ = getCarInitParams(device)
     min_dist = EVAL_MIN_DIST
     n_agents = N_AGENTS
@@ -997,7 +1053,7 @@ def show_simulation():
         )
         ax.add_patch(safety_circle)
         safety_patches.append(safety_circle)
-        target_markers.append(ax.plot(xbar[base], xbar[base + 1], marker="*", markersize=14, color=color)[0])
+        target_markers.append(draw_route(ax, ref, i, color, star_size=14, start=x_log[0]))
         start_markers.append(ax.plot(x_log[0, base], x_log[0, base + 1], marker="o", markersize=7, color=color, fillstyle="none")[0])
 
     time_text = ax.text(0.02, 0.97, "", transform=ax.transAxes, va="top")

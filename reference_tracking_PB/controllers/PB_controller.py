@@ -30,9 +30,8 @@ class PerfBoostController(nn.Module):
         ren_internal_state_init=None,
         # misc
         output_amplification: float=20,
-        heading_encoding: bool = False,
         clock_tau: float = None, dt: float = 0.04,
-        ref_change_input: bool = False,
+        ref_trace_tau: float = None,
     ):
         """
          Args:
@@ -47,13 +46,13 @@ class PerfBoostController(nn.Module):
             epsilon (float, optional): Positive and negligible scalar to force positive definite matrices.
             contraction_rate_lb (float, optional): Lower bound on the contraction rate. Defaults to 1.
             ren_internal_state_init (torch.Tensor, optional): initial state of the REN. Defaults to 0 when None.
-            heading_encoding (bool): if True, each car's heading entry of w_hat is replaced by
-                (sin, 1 - cos) before the REN and the MLP (8 instead of 7 inputs per car).
             clock_tau (float): if set, the REN also gets a clock exp(-age dt / clock_tau) [s], with age = steps since
                 the last reference change (restarts at every new goal; t = 0 counts as a change). None = off.
-            dt (float): time step [s] of the plant, for the clock.
-            ref_change_input (bool): if True, the REN also gets the reference change per car:
-                delta goal (x, y) and delta target heading as (sin, 1 - cos). Non-zero only when the reference switches.
+            dt (float): time step [s] of the plant, for the clock and the reference trace.
+            ref_trace_tau (float): if set, the REN also gets a trace per car [s]: whenever the car's goal changes (and at
+                t = 0) it jumps by what is left to travel, new goal minus the car's current pose (x, y and heading as
+                sin, 1 - cos), and then decays from that value with time constant ref_trace_tau.
+                0 = only the pulse itself (non-zero only at the step of the change). None = off.
         """
         super().__init__()
 
@@ -75,12 +74,14 @@ class PerfBoostController(nn.Module):
         self.dim_in = self.input_init.shape[-1]
         self.dim_out = self.output_init.shape[-1]
         self.n_agents = self.dim_in // 7
-        self.heading_encoding = heading_encoding
-        # size of the networks' input w_in: 7 per car, or 8 with (sin theta, 1 - cos theta) instead of theta
-        self.dim_w_in = (8 if heading_encoding else 7) * self.n_agents
-        # REN input: w_in, plus the clock (1) and the reference change (4 per car: dx, dy, sin, 1 - cos) if enabled
-        self.clock_tau, self.dt, self.ref_change_input = clock_tau, dt, ref_change_input
-        self.dim_ren_in = self.dim_w_in + (1 if clock_tau is not None else 0) + (4 * self.n_agents if ref_change_input else 0)
+        # size of the networks' input w_in: 8 per car (w_hat with (sin theta, 1 - cos theta) instead of theta)
+        self.dim_w_in = 8 * self.n_agents
+        # REN input: w_in, plus the clock (1) and the reference trace (4 per car: dx, dy, sin, 1 - cos) if enabled
+        self.clock_tau, self.dt, self.ref_trace_tau = clock_tau, dt, ref_trace_tau
+        self.dim_ren_in = self.dim_w_in + (1 if clock_tau is not None else 0) + (4 * self.n_agents if ref_trace_tau is not None else 0)
+        # per-step factor of the reference trace: exp(-dt / tau), so a change c is c * exp(-t / tau) after t seconds
+        # (tau = 0: factor 0, the trace is only the change at its own step)
+        self.ref_trace_decay = math.exp(-dt / ref_trace_tau) if ref_trace_tau else 0.0
 
         # define the REN
         self.c_ren = ContractiveREN(
@@ -109,6 +110,7 @@ class PerfBoostController(nn.Module):
         self.last_xbar = self.xbar_init.detach().clone()
         self.last_theta_ref = self.theta_ref_init.detach().clone()
         self.clock_age = None   # steps since the last reference change, per sample (set at the first call)
+        self.ref_trace = None   # decaying trace of the reference change, per sample (set at the first call)
 
         self.c_ren.x = self.c_ren.init_x    # reset the REN state to the initial value
 
@@ -146,15 +148,12 @@ class PerfBoostController(nn.Module):
 
         # 3) controller input: per car, replace the heading entry theta by (sin theta, 1 - cos theta)
         #    -> continuous across +-pi, and still 0 when w_hat = 0 (keeps the l_p property)
-        if self.heading_encoding:
-            w_hat_per_car = w_hat.view(batch_size, 1, self.n_agents, 7)      # [x, y, theta, v_f, beta_f, beta_r, delta]
-            position = w_hat_per_car[..., 0:2]
-            theta = w_hat_per_car[..., 2:3]
-            rest = w_hat_per_car[..., 3:7]                                    # v_f, beta_f, beta_r, delta
-            w_in = torch.cat((position, torch.sin(theta), 1 - torch.cos(theta), rest), dim=-1)
-            w_in = w_in.view(batch_size, 1, 8 * self.n_agents)
-        else:
-            w_in = w_hat
+        w_hat_per_car = w_hat.view(batch_size, 1, self.n_agents, 7)          # [x, y, theta, v_f, beta_f, beta_r, delta]
+        position = w_hat_per_car[..., 0:2]
+        theta = w_hat_per_car[..., 2:3]
+        rest = w_hat_per_car[..., 3:7]                                        # v_f, beta_f, beta_r, delta
+        w_in = torch.cat((position, torch.sin(theta), 1 - torch.cos(theta), rest), dim=-1)
+        w_in = w_in.view(batch_size, 1, 8 * self.n_agents)
 
         # 4) M1 (REN) input: w_in, plus optional exogenous l_p signals that let M1 act after w_hat has vanished
         delta_xbar = xbar - self.last_xbar                                    # [B, 1, 2*n_agents]  reference change
@@ -169,9 +168,19 @@ class PerfBoostController(nn.Module):
             self.clock_age = torch.where(ref_changed, torch.zeros_like(self.clock_age), self.clock_age)
             clock = torch.exp(-self.clock_age * self.dt / self.clock_tau)      # [B, 1, 1]
             ren_parts.append(clock)
-        if self.ref_change_input:
-            # reference change itself: non-zero only at a switch (and at t = 0, from the zero initial reference) -> l_p
-            ren_parts += [delta_xbar, torch.sin(delta_theta), 1 - torch.cos(delta_theta)]
+        if self.ref_trace_tau is not None:
+            # pulse when a car's goal changes (and at t = 0, from the zero initial reference): what is left to travel,
+            # new goal minus the car's current pose; 0 at all other steps
+            goal_changed = (delta_xbar.view(batch_size, 1, self.n_agents, 2).abs().sum(-1) + (1 - torch.cos(delta_theta))) > 0   # [B, 1, n_agents]
+            car_pose = input_t.view(batch_size, 1, self.n_agents, 7)          # measured state per car
+            pulse_xy = (xbar.view(batch_size, 1, self.n_agents, 2) - car_pose[..., 0:2]) * goal_changed.unsqueeze(-1)   # [B, 1, n_agents, 2]
+            pulse_theta = (theta_ref - car_pose[..., 2]) * goal_changed      # [B, 1, n_agents]
+            pulse = torch.cat((pulse_xy.reshape(batch_size, 1, 2 * self.n_agents),
+                               torch.sin(pulse_theta), 1 - torch.cos(pulse_theta)), dim=2)   # [B, 1, 4*n_agents]
+            # trace: jumps by the pulse, then decays from that value: trace_t = decay * trace_{t-1} + pulse_t
+            # -> l_p (finitely many bounded pulses, stable filter)
+            self.ref_trace = pulse if self.ref_trace is None else self.ref_trace_decay * self.ref_trace + pulse
+            ren_parts.append(self.ref_trace)
         ren_input = torch.cat(ren_parts, dim=2)                               # [B, 1, dim_ren_in]
 
         # 5) M1 (REN) on ren_input; M2 (MLP) on w_in, the goal (x, y) and the target heading
