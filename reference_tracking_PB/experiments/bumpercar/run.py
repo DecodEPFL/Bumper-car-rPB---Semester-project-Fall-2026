@@ -120,7 +120,6 @@ def main():
     dim_internal=args.dim_internal,
     dim_nl=args.dim_nl,
     initialization_std=args.cont_init_std,
-    output_amplification=1,
     ren_internal_state_init=None,
     dt=sys.dt,
     ref_trace_tau=args.ren_ref_trace_tau,
@@ -131,40 +130,19 @@ def main():
     warm_optimizer_state = None   # Adam state of the loaded run (only if the whole controller was loaded)
     if args.load_controller is not None:
         ckpt = torch.load(args.load_controller, map_location=device)
-        if "controller_state_dict" in ckpt:
-            current_state = ctl.state_dict()
-            # older checkpoints store M2 as "MLP.*"
-            stored_state = {("M2." + k[len("MLP."):] if k.startswith("MLP.") else k): v
-                            for k, v in ckpt["controller_state_dict"].items()}
-            controller_state = {
-                k: v for k, v in stored_state.items()
-                if k in current_state and current_state[k].shape == v.shape
-            }
-            skipped = sorted(set(stored_state.keys()) - set(controller_state.keys()))
-            ctl.load_state_dict(controller_state, strict=False)
-        elif "ren_state_dict" in ckpt:
-            current_state = ctl.c_ren.state_dict()
-            ren_state = {
-                k: v for k, v in ckpt["ren_state_dict"].items()
-                if k in current_state and current_state[k].shape == v.shape
-            }
-            skipped = sorted(set(ckpt["ren_state_dict"].keys()) - set(ren_state.keys()))
-            ctl.c_ren.load_state_dict(ren_state, strict=False)
-            m2_state = ckpt.get("m2_state_dict", ckpt.get("mlp_state_dict"))   # older checkpoints: "mlp_state_dict"
-            if m2_state is not None and args.m2 == ckpt.get("args", {}).get("m2", "mlp"):
-                ctl.M2.load_state_dict(m2_state, strict=False)
-        else:
-            current_state = ctl.c_ren.state_dict()
-            ren_state = {
-                k: v for k, v in ckpt.items()
-                if k in current_state and current_state[k].shape == v.shape
-            }
-            skipped = sorted(set(ckpt.keys()) - set(ren_state.keys()))
-            ctl.c_ren.load_state_dict(ren_state, strict=False)
+        # load every tensor whose name and shape match; the rest keeps its initialization (e.g. a REN of another
+        # size, or the other M2 type)
+        current_state = ctl.state_dict()
+        controller_state = {
+            k: v for k, v in ckpt["controller_state_dict"].items()
+            if k in current_state and current_state[k].shape == v.shape
+        }
+        skipped = sorted(set(ckpt["controller_state_dict"].keys()) - set(controller_state.keys()))
+        ctl.load_state_dict(controller_state, strict=False)
         ctl.reset()
         logger.info(
             f"[INFO] loaded compatible controller tensors from {args.load_controller}; "
-            f"skipped {len(skipped)} incompatible/non-REN entries."
+            f"skipped {len(skipped)} incompatible entries: {skipped}"
         )
         if len(skipped) == 0 and "optimizer_state_dict" in ckpt:
             warm_optimizer_state = ckpt["optimizer_state_dict"]

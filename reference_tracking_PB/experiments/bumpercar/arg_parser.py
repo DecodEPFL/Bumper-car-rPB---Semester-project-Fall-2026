@@ -21,25 +21,23 @@ def argument_parser():
 
     # controller
     parser.add_argument('--cont-init-std', type=float, default=0.1, help='Initialization std for controller params. Default is 0.1.')
-    parser.add_argument('--dim-internal', type=int, default=8, help='Dimension of the internal state of the controller. Adjusts the size of the linear part of REN. Default is 8.')
-    parser.add_argument('--dim-nl', type=int, default=8, help='size of the non-linear part of REN. Default is 8.')
-    parser.add_argument('--m2', type=str, default='gru', choices=['mlp', 'gru'], help='M2 of the rPB: "mlp" = one MLP for all cars on [w_hat, goals, target headings]; "gru" = per car with shared weights, a GRU on the car\'s own w_hat, goal, target heading and current state (goal relative to the car, heading error, nearest other car), output bounded by --m2-gain-bound. Default is gru.')
-    parser.add_argument('--m2-gain-bound', type=float, default=5.0, help='GRU M2: bound c of the output gain, c * tanh(.) per component. Default is 5 (trained MLP M2 outputs reach about 3.2).')
-    parser.add_argument('--ren-ref-trace-tau', type=float, default=5.0, help='Time constant [s] of the reference-change trace fed to the REN: it jumps by the change (delta goal x, y and delta heading as sin, 1 - cos) and decays from that value. 0 = only the raw change; a negative value turns the input off. Default is 3.')
+    parser.add_argument('--dim-internal', type=int, default=8, help='Dimension of the internal state of the REN (per car). Adjusts the size of the linear part of REN. Default is 8.')
+    parser.add_argument('--dim-nl', type=int, default=8, help='size of the non-linear part of REN (per car). Default is 8.')
+    parser.add_argument('--m2', type=str, default='gru', choices=['mlp', 'gru'], help='M2 of the rPB, per car with shared weights, on the car\'s own w_hat, goal, target heading and current state (goal relative to the car, heading error, nearest other car), output bounded by --m2-gain-bound: "gru" (with memory) or "mlp" (without memory). Default is gru.')
+    parser.add_argument('--m2-gain-bound', type=float, default=5.0, help='M2: bound c of the output gain, c * tanh(.) per component. Default is 5 (trained M2 outputs reach about 3.2).')
+    parser.add_argument('--ren-ref-trace-tau', type=float, default=5.0, help='Time constant [s] of the reference trace per car fed to the REN: at a goal change it jumps by the way still to go (goal minus pose: x, y and heading as sin, 1 - cos) and decays from that value. 0 = only the pulse itself. Default is 5.')
 
     # loss
-    parser.add_argument('--alpha-u', type=float, default=0.1/400, help='Weight of the loss due to control input "u". Default is 0.1/400.')  #TODO: 400 is output_amplification^2
+    parser.add_argument('--alpha-u', type=float, default=0.1/400, help='Weight of the effort loss: squared rPB offset |dxref|^2, averaged over time. Default is 0.1/400.')
     parser.add_argument('--alpha-col', type=float, default=1500, help='Weight of the collision avoidance loss. Default is 1500 if "col-av" is True, else None.')
     parser.add_argument('--alpha-obst', type=float, default=20000, help='Weight of the obstacle avoidance loss. Default is 20000 if "obst-av" is True, else None.')
     parser.add_argument('--obst-safe-dist', type=float, default=1.7, help='Obstacle cost is 0 beyond this distance [m] from each obstacle center (Gaussian minus its value there, clipped at 0). Default is 1.7 (sim.py hit radius 1.5 + 0.2 margin).')
-    parser.add_argument('--alpha-bounds', type=float, default=1e4, help='Weight of the arena loss: quadratic in how far a car is inside the 0.4 m margin of the arena edge (x in [-3.5, 3.5], y in [-4, 6]). Default is 0 (off).')
+    parser.add_argument('--alpha-bounds', type=float, default=1e4, help='Weight of the arena loss: quadratic in how far a car center is inside the 1 m margin (car radius) of the arena edge (x in [-3.5, 3.5], y in [-4, 6]). Default is 1e4 (0 = off).')
     parser.add_argument('--min-dist', type=float, default=2.0, help='Minimum distance [m] between car centers; the collision loss is active below min_dist + 0.2. Default is 2.0 if "col-av" is True, else None.')
     parser.add_argument('--q-final-factor', type=float, default=500, help='Terminal position weight: Q_final = this * Q (per car (2/15) * factor per m^2), averaged over the --goal-window-steps arrival window of every goal leg. Default is 570 (final position and final heading of similar weight: 10 cm ~ 10 deg).')
     parser.add_argument('--alpha-heading', type=float, default=50.0, help='Weight of the running heading loss 1 - cos(theta* - theta), weighted by exp(-d^2 / (2 * heading_radius^2)) with d the distance to the goal. Default is 50 (0 = off).')
     parser.add_argument('--alpha-heading-final', type=float, default=50.0, help='Weight of the terminal heading loss over the --goal-window-steps arrival window of every goal leg. Default is 50 (0 = off).')
     parser.add_argument('--heading-radius', type=float, default=0.75, help='Length scale [m] of the soft mask of the running heading loss (weight 0.61 at this distance from the goal). Default is 0.75.')
-    parser.add_argument('--alpha-corridor', type=float, default=0.0, help='Weight of the approach-corridor loss: squared sideways offset from the line through the active goal along its target heading, weighted by exp(-d^2 / (2 * corridor_radius^2)) (no gradient through the weight) and 0 within --obst-safe-dist of an obstacle. Default is 0 (off).')
-    parser.add_argument('--corridor-radius', type=float, default=1.5, help='Length scale [m] of the soft mask of the corridor loss (weight 0.61 at this distance from the goal). Default is 1.5.')
     parser.add_argument('--alpha-smooth', type=float, default=50.0, help='Weight of the smoothness loss: squared change of the rPB offset dxref per step, averaged over time (penalizes jumps of the tracked reference, not its size). Default is 50 (0 = off).')
     parser.add_argument('--alpha-offset-final', type=float, default=20.0, help='Weight of the squared rPB offset dxref over the last --goal-window-steps steps of the rollout (the car must have settled by the end). Default is 20 (0 = off).')
     parser.add_argument('--goal-window-steps', type=int, default=50, help='Arrival window: number of time steps at the end of every goal leg over which the final position and heading losses are averaged (also the window of the offset loss at the end). Default is 50 (2 s at dt 0.04).')
@@ -72,8 +70,6 @@ def argument_parser():
     if args.batch_size == -1:
         args.batch_size = args.num_rollouts  # use all train data
 
-    if args.ren_ref_trace_tau is not None and args.ren_ref_trace_tau < 0:
-        args.ren_ref_trace_tau = None   # reference-change input off
 
     # assertions and warning
     if not args.col_av:
@@ -98,7 +94,7 @@ def print_args(args):
     msg += ' -- dim_nl: %i' % args.dim_nl + ' -- cont_init_std: %.2f'% args.cont_init_std
     msg += ' -- REN reference trace tau: %s s' % args.ren_ref_trace_tau
     msg += ' -- base turn speed: %s' % args.turn_speed
-    msg += ' -- M2: %s' % args.m2 + (' (gain bound %g)' % args.m2_gain_bound if args.m2 == 'gru' else '')
+    msg += ' -- M1: REN per car -- M2: %s per car (gain bound %g)' % (args.m2, args.m2_gain_bound)
 
     msg += '\n[INFO] Loss:  alpha_u: %.6f' % args.alpha_u + ' -- q_final_factor: %g' % args.q_final_factor
     msg += ' -- alpha_col: %.f -- min_dist: %g' % (args.alpha_col, args.min_dist) if args.col_av else ' -- no collision avoidance'
@@ -106,7 +102,6 @@ def print_args(args):
     msg += ' -- alpha_bounds: %g' % args.alpha_bounds
     msg += ' -- alpha_heading: %g -- alpha_heading_final: %g -- heading_radius: %g -- goal_window_steps: %i -- alpha_offset_final: %g' % (
         args.alpha_heading, args.alpha_heading_final, args.heading_radius, args.goal_window_steps, args.alpha_offset_final)
-    msg += ' -- alpha_corridor: %g -- corridor_radius: %g' % (args.alpha_corridor, args.corridor_radius)
     msg += ' -- alpha_smooth: %g' % args.alpha_smooth
 
     msg += '\n[INFO] Optimizer: lr: %.2e' % args.lr

@@ -25,6 +25,26 @@ class MLP(nn.Module):
         return  self.mlp(x)
 
 
+class SharedMLPGain(nn.Module):
+    """
+    M2 per car with shared weights, without memory: the MLP above on each car's own features (the same weights for all
+    cars), output gain (dX, dY) per car bounded by gain_bound * tanh -> |gain| <= gain_bound, so M1 * M2 stays in l_p.
+    Same inputs and bound as SharedGRUGain; the only difference is the GRU's memory.
+    """
+    def __init__(self, dim_in, gain_bound=5.0):
+        super().__init__()
+        self.mlp = MLP(dim_in=dim_in, dim_out=2)
+        self.dim_in, self.gain_bound = dim_in, gain_bound
+
+    def forward(self, features, hidden=None):
+        """
+        features: [B * n_agents, dim_in] -> gain [B * n_agents, 2]; hidden is passed through unchanged (no memory),
+        so the controller calls both M2 types the same way
+        """
+        gain = self.gain_bound * torch.tanh(self.mlp(features))
+        return gain, hidden
+
+
 
 class ZeroController(torch.nn.Module):
     def __init__(self, ref_dim):

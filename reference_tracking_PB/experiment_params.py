@@ -14,19 +14,8 @@ SCENARIOS = {
                   "TL": (-2.0, 4.5, torch.pi / 2), "TR": (2.0, 4.5, torch.pi / 2)},
         # missions: per car (start, goal of leg 1, goal of leg 2) as pose names; the horizon is split into equal legs.
         # All missions are drawn equally often. The first mission is the nominal scenario (plots, report figures).
-        "missions": [
-            [("BL", "TR", "BL"), ("BR", "TL", "BR")],   # crossing goal-and-back (nominal)
-        ],
         # single goal: crossing to the top, facing up
-        # "missions": [[("BL", "TR"), ("BR", "TL")]],
-        # "missions": [
-        #     [("BL", "TR", "BL"), ("BR", "TL", "BR")],   # crossing goal-and-back (nominal)
-        #     [("BL", "TL", "BL"), ("BR", "TR", "BR")],   # parallel goal-and-back (each car stays on its side)
-        #     [("BL", "TR", "BL"), ("BR", "BR", "BR")],   # one car drives goal-and-back, the other is parked
-        #     [("TR", "BL", "BL"), ("TL", "BR", "BR")],   # return only (start at the top)
-        #     [("TR", "BL", "BL"), ("TL", "TL", "TL")],   # one car returns alone, the other is parked at the top
-        #     [("BL", "BL", "TR"), ("BR", "TL", "TL")],   # staggered: one car waits a leg, then drives up
-        # ],
+        "missions": [[("BL", "TR"), ("BR", "TL")]],
         # single scenario instead of missions: "start": one pose per car; "goal": one pose per car, or a list of goals
         # visited in order (each a list with one pose per car), e.g.
         # "start": [(-2.0, -2.5, 0.0), (2.0, -2.5, -torch.pi)],
@@ -147,7 +136,5 @@ def getExtraLossParams():
         alpha_offset_final=args.alpha_offset_final,
         obst_safe_dist=args.obst_safe_dist,
         alpha_bounds=args.alpha_bounds,
-        alpha_corridor=args.alpha_corridor,
-        corridor_radius=args.corridor_radius,
         alpha_smooth=args.alpha_smooth,
     )

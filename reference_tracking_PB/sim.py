@@ -31,7 +31,7 @@ TRAINED_PBR_MODEL_PATH = ARGS.checkpoint or os.path.join(BASE_DIR, "experiments/
 TRAINING_SETTINGS = ["n_agents", "start_radius", "start_heading_range", "goal_heading_range",
                      "alpha_u", "q_final_factor", "alpha_col", "alpha_obst", "min_dist", "obst_safe_dist",
                      "alpha_heading", "alpha_heading_final", "heading_radius", "goal_window_steps", "alpha_offset_final",
-                     "alpha_bounds", "alpha_corridor", "corridor_radius", "alpha_smooth", "turn_speed"]
+                     "alpha_bounds", "alpha_smooth", "turn_speed"]
 checkpoint = torch.load(TRAINED_PBR_MODEL_PATH, map_location="cpu", weights_only=False)
 stored_args = checkpoint.get("args", {})
 stored_args = stored_args if isinstance(stored_args, dict) else vars(stored_args)
@@ -249,31 +249,14 @@ def load_controller(system, checkpoint_path):
         dim_internal=args.get("dim_internal", 8),
         dim_nl=args.get("dim_nl", 8),
         initialization_std=args.get("cont_init_std", 0.1),
-        output_amplification=1,
         ren_internal_state_init=None,
         dt=system.dt,
-        # reference trace; checkpoints from before the trace: raw reference change (tau 0) if they had it, else off
-        ref_trace_tau=args.get("ren_ref_trace_tau", 0.0 if args.get("ren_ref_change") else None),
-        m2_type=args.get("m2", "mlp"),                     # checkpoints from before the GRU M2: MLP
-        m2_gain_bound=args.get("m2_gain_bound", 5.0),
+        ref_trace_tau=args["ren_ref_trace_tau"],
+        m2_type=args["m2"],
+        m2_gain_bound=args["m2_gain_bound"],
     ).to(device)
-
-    if "controller_state_dict" in checkpoint:
-        # older checkpoints store M2 as "MLP.*"
-        state = {("M2." + key[len("MLP."):] if key.startswith("MLP.") else key): value
-                 for key, value in checkpoint["controller_state_dict"].items()}
-        controller.load_state_dict(state, strict=False)
-    elif "ren_state_dict" in checkpoint:
-        controller.c_ren.load_state_dict(checkpoint["ren_state_dict"], strict=False)
-        m2_state = checkpoint.get("m2_state_dict", checkpoint.get("mlp_state_dict"))
-        if m2_state is not None:
-            controller.M2.load_state_dict(m2_state, strict=False)
-    else:
-        ren_state = {
-            key: value for key, value in checkpoint.items()
-            if key in controller.c_ren.state_dict()
-        }
-        controller.c_ren.load_state_dict(ren_state, strict=False)
+    # all tensors must match: a checkpoint of another controller structure fails here instead of loading partly
+    controller.load_state_dict(checkpoint["controller_state_dict"])
 
     controller.eval()
     controller.reset()

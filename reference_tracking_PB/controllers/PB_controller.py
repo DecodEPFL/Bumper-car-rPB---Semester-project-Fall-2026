@@ -7,7 +7,7 @@ import time
 from argparse import Namespace
 from config import device
 from .contractive_ren import ContractiveREN
-from .MLP import MLP, ZeroController
+from .MLP import SharedMLPGain, ZeroController
 from .GRU import SharedGRUGain
 from utils.assistive_functions import to_tensor
 
@@ -30,17 +30,15 @@ class PerfBoostController(nn.Module):
         posdef_tol: float = 0.001, contraction_rate_lb: float = 1.0,
         ren_internal_state_init=None,
         # misc
-        output_amplification: float=20,
         dt: float = 0.04,
-        ref_trace_tau: float = None,
-        m2_type: str = "mlp", m2_gain_bound: float = 5.0,
+        ref_trace_tau: float = 5.0,
+        m2_type: str = "gru", m2_gain_bound: float = 5.0,
     ):
         """
          Args:
             noiseless_forward: system dynamics without process noise. can be TV.
             input_init (torch.Tensor): initial input to the controller.
             output_init (torch.Tensor): initial output from the controller before anything is calculated.
-            output_amplification (float): TODO
             * the following are the same as AcyclicREN args:
             dim_internal (int): Internal state (x) dimension. This state evolves with contraction properties.
             dim_nl (int): Dimension of the input ("v") and ouput ("w") of the nonlinear static block of REN.
@@ -49,18 +47,20 @@ class PerfBoostController(nn.Module):
             contraction_rate_lb (float, optional): Lower bound on the contraction rate. Defaults to 1.
             ren_internal_state_init (torch.Tensor, optional): initial state of the REN. Defaults to 0 when None.
             dt (float): time step [s] of the plant, for the reference trace.
-            ref_trace_tau (float): if set, the REN also gets a trace per car [s]: whenever the car's goal changes (and at
-                t = 0) it jumps by what is left to travel, new goal minus the car's current pose (x, y and heading as
-                sin, 1 - cos), and then decays from that value with time constant ref_trace_tau.
-                0 = only the pulse itself (non-zero only at the step of the change). None = off.
-            m2_type (str): "mlp": M2 is one MLP for all cars on [w_in, goals, target headings]. "gru": M2 per car with
-                shared weights (SharedGRUGain), on the car's own w_in, goal and target heading plus its current state
-                (goal relative to the car, heading error, nearest other car), output bounded by m2_gain_bound.
-            m2_gain_bound (float): bound of the GRU M2's output gain per component (m2_type "gru").
+            ref_trace_tau (float): time constant [s] of the reference trace per car: whenever the car's goal changes (and
+                at t = 0) it jumps by what is left to travel, new goal minus the car's current pose (x, y and heading as
+                sin, 1 - cos), and then decays from that value. 0 = only the pulse itself.
+            m2_type (str): M2 per car with shared weights, on the car's own w_in, goal and target heading plus its
+                current state (goal relative to the car, heading error, nearest other car): "gru" (SharedGRUGain, with
+                memory) or "mlp" (SharedMLPGain, without memory). Output bounded by m2_gain_bound.
+            m2_gain_bound (float): bound of M2's output gain per component.
+
+        Everything is per car: M1 (REN) and M2 are the same networks for every car, each car has its own input and its
+        own internal state; the cars are rows of the batch (row = sample * n_agents + car), so the network sizes do not
+        depend on the number of cars.
         """
         super().__init__()
 
-        self.output_amplification = output_amplification
 
         # set initial conditions
         # self.input_init = input_init.reshape(1, -1)
@@ -78,32 +78,27 @@ class PerfBoostController(nn.Module):
         self.dim_in = self.input_init.shape[-1]
         self.dim_out = self.output_init.shape[-1]
         self.n_agents = self.dim_in // 7
-        # size of the networks' input w_in: 8 per car (w_hat with (sin theta, 1 - cos theta) instead of theta)
-        self.dim_w_in = 8 * self.n_agents
-        # REN input: w_in, plus the reference trace (4 per car: dx, dy, sin, 1 - cos) if enabled
-        self.dt, self.ref_trace_tau = dt, ref_trace_tau
-        self.dim_ren_in = self.dim_w_in + (4 * self.n_agents if ref_trace_tau is not None else 0)
         # per-step factor of the reference trace: exp(-dt / tau), so a change c is c * exp(-t / tau) after t seconds
         # (tau = 0: factor 0, the trace is only the change at its own step)
-        self.ref_trace_decay = math.exp(-dt / ref_trace_tau) if ref_trace_tau else 0.0
+        self.dt, self.ref_trace_tau = dt, ref_trace_tau
+        self.ref_trace_decay = math.exp(-dt / ref_trace_tau) if ref_trace_tau > 0 else 0.0
 
-        # define the REN
+        # M1: one REN for every car. Input per car: w_in (8: w_hat with (sin, 1 - cos) for the heading) and the
+        # reference trace (4: dx, dy, sin, 1 - cos); output per car: energy (2)
         self.c_ren = ContractiveREN(
-            dim_in=self.dim_ren_in, dim_out=self.dim_out, dim_internal=dim_internal,
+            dim_in=12, dim_out=2, dim_internal=dim_internal,
             dim_nl=dim_nl, initialization_std=initialization_std,
             internal_state_init=ren_internal_state_init,
             posdef_tol=posdef_tol, contraction_rate_lb=contraction_rate_lb
         ).to(device)
 
-        # M2 (older checkpoints store it as "MLP.*": the loaders map those keys to "M2.*")
+        # M2: one network for every car. Features per car: w_in (8), goal (2), target heading (2),
+        # goal relative to the car (2), heading error (2), nearest other car relative to the car (2)
         self.m2_type = m2_type
-        if m2_type == "mlp":
-            # one MLP for all cars, input: [w_in, goal (x, y) per car, target heading (sin, 1 - cos) per car]
-            self.M2 = MLP(dim_in=self.dim_w_in + self.dim_out + 2 * self.n_agents, dim_out=self.dim_out)
-        elif m2_type == "gru":
-            # per car, shared weights; features per car: w_in (8), goal (2), target heading (2),
-            # goal relative to the car (2), heading error (2), nearest other car relative to the car (2)
+        if m2_type == "gru":
             self.M2 = SharedGRUGain(dim_in=18, gain_bound=m2_gain_bound)
+        elif m2_type == "mlp":
+            self.M2 = SharedMLPGain(dim_in=18, gain_bound=m2_gain_bound)
         else:
             raise ValueError(f"unknown m2_type {m2_type}")
 
@@ -142,90 +137,75 @@ class PerfBoostController(nn.Module):
         """
 
 
-        batch_size = input_t.shape[0]
+        B, n = input_t.shape[0], self.n_agents
+        car = input_t.view(B, n, 7)                     # measured state per car: x, y, theta, v_f, beta_f, beta_r, delta
+        position, theta = car[..., 0:2], car[..., 2]    # [B, n, 2], [B, n]
+        goal = xbar.view(B, n, 2)                       # goal position per car
+        target = theta_ref.view(B, n)                   # target heading per car
 
-        # 1) internal model: predicted state from the previous state and input, with the reference the plant used
-        #    in this step (the current one) -> a known reference change is not mistaken for a disturbance.
-        #    At t = 0 there is no previous step: w_hat_0 is set to 0 in 2).
+        # 1) internal model, all cars in one call (the cars are dynamically decoupled: each car's prediction uses only
+        #    its own state, input and goal). It uses the reference the plant used in this step (the current one), so a
+        #    known goal change is not mistaken for a disturbance. At t = 0 there is no previous step (w_hat_0 = 0 below).
         x_predicted, _ = self.noiseless_forward(
             t=self.t,
             x=self.last_input,    # last input to the controller is the last state of the plant
             u=self.last_output,   # last output of the controller is the last input to the plant
             v=self.last_vg,
             xbar=xbar if self.t > 0 else self.last_xbar,
-        )                                                                     # [B, 1, 7*n_agents]
+        )                                                                     # [B, 1, 7*n]
 
-        # 2) reconstructed disturbance: measured state minus predicted state
-        w_hat = input_t - x_predicted                                         # [B, 1, 7*n_agents]
+        # 2) reconstructed disturbance per car: measured state minus predicted state
+        w_hat = (input_t - x_predicted).view(B, n, 7)                        # [B, n, 7]
         if self.t == 0:
             # the start state is known, not a disturbance: w_hat_0 = 0. The start reaches M1 relative to the goal
             # through the reference-trace pulse at t = 0 -> a car with nothing to do gets no energy of its own
             w_hat = torch.zeros_like(w_hat)
 
-        # 3) controller input: per car, replace the heading entry theta by (sin theta, 1 - cos theta)
-        #    -> continuous across +-pi, and still 0 when w_hat = 0 (keeps the l_p property)
-        w_hat_per_car = w_hat.view(batch_size, 1, self.n_agents, 7)          # [x, y, theta, v_f, beta_f, beta_r, delta]
-        position = w_hat_per_car[..., 0:2]
-        theta = w_hat_per_car[..., 2:3]
-        rest = w_hat_per_car[..., 3:7]                                        # v_f, beta_f, beta_r, delta
-        w_in = torch.cat((position, torch.sin(theta), 1 - torch.cos(theta), rest), dim=-1)
-        w_in = w_in.view(batch_size, 1, 8 * self.n_agents)
+        # 3) w_in per car: heading entry as (sin, 1 - cos) -> continuous across +-pi, and 0 when w_hat = 0 (l_p)
+        w_theta = w_hat[..., 2:3]
+        w_in = torch.cat((w_hat[..., 0:2], torch.sin(w_theta), 1 - torch.cos(w_theta), w_hat[..., 3:7]), dim=-1)   # [B, n, 8]
 
-        # 4) M1 (REN) input: w_in, plus the reference trace, an exogenous l_p signal that lets M1 act after w_hat has vanished
-        delta_xbar = xbar - self.last_xbar                                    # [B, 1, 2*n_agents]  reference change
-        delta_theta = theta_ref - self.last_theta_ref                         # [B, 1, n_agents]
-        ren_parts = [w_in]
-        if self.ref_trace_tau is not None:
-            # pulse when a car's goal changes (and at t = 0, from the zero initial reference): what is left to travel,
-            # new goal minus the car's current pose; 0 at all other steps
-            goal_changed = (delta_xbar.view(batch_size, 1, self.n_agents, 2).abs().sum(-1) + (1 - torch.cos(delta_theta))) > 0   # [B, 1, n_agents]
-            car_pose = input_t.view(batch_size, 1, self.n_agents, 7)          # measured state per car
-            pulse_xy = (xbar.view(batch_size, 1, self.n_agents, 2) - car_pose[..., 0:2]) * goal_changed.unsqueeze(-1)   # [B, 1, n_agents, 2]
-            pulse_theta = (theta_ref - car_pose[..., 2]) * goal_changed      # [B, 1, n_agents]
-            pulse = torch.cat((pulse_xy.reshape(batch_size, 1, 2 * self.n_agents),
-                               torch.sin(pulse_theta), 1 - torch.cos(pulse_theta)), dim=2)   # [B, 1, 4*n_agents]
-            # trace: jumps by the pulse, then decays from that value: trace_t = decay * trace_{t-1} + pulse_t
-            # -> l_p (finitely many bounded pulses, stable filter)
-            self.ref_trace = pulse if self.ref_trace is None else self.ref_trace_decay * self.ref_trace + pulse
-            ren_parts.append(self.ref_trace)
-        ren_input = torch.cat(ren_parts, dim=2)                               # [B, 1, dim_ren_in]
+        # 4) reference trace per car: when this car's goal changes (and at t = 0, from the zero initial reference), the
+        #    way still to go: own new goal minus own pose (x, y and heading as sin, 1 - cos); 0 at all other steps.
+        #    trace_t = decay * trace_{t-1} + pulse_t: finitely many bounded pulses, stable filter -> l_p
+        last_goal = self.last_xbar.view(-1, n, 2)
+        last_target = self.last_theta_ref.view(-1, n)
+        goal_changed = ((goal - last_goal).abs().sum(-1) + (1 - torch.cos(target - last_target))) > 0   # [B, n]
+        to_turn = target - theta                                                          # [B, n]
+        pulse = torch.cat((goal - position, torch.sin(to_turn).unsqueeze(-1), (1 - torch.cos(to_turn)).unsqueeze(-1)),
+                          dim=-1) * goal_changed.unsqueeze(-1)                            # [B, n, 4]
+        self.ref_trace = pulse if self.ref_trace is None else self.ref_trace_decay * self.ref_trace + pulse
 
-        # 5) M1 (REN) on ren_input. theta* is not given to the REN: it does not vanish, so it would break l_p
-        output_REN = self.c_ren.forward(ren_input)
+        # 5) M1: the same REN for every car, own input, own state (rows: sample * n + car).
+        #    theta* is not given to the REN: it does not vanish, so it would break l_p
+        ren_input = torch.cat((w_in, self.ref_trace), dim=-1)                             # [B, n, 12]
+        m1 = self.c_ren.forward(ren_input.view(B * n, 1, 12)).view(B, n, 2)              # energy per car
 
-        # 6) M2
-        if self.m2_type == "mlp":
-            # one MLP for all cars on w_in, the goal (x, y) and the target heading as (sin theta*, 1 - cos theta*) per car
-            mlp_input = torch.cat((w_in, xbar, torch.sin(theta_ref), 1 - torch.cos(theta_ref)), dim=2).view(batch_size, 1, -1)
-            output_M2 = self.M2.forward(mlp_input)                            # [B, 1, 2*n_agents]
+        # 6) M2: the same network for every car, own features, own memory (GRU). Features: own w_in, goal and target
+        #    heading, plus the current state: goal relative to the car, heading error, nearest other car
+        to_goal = goal - position                                                         # [B, n, 2]
+        heading_error = target - theta                                                    # [B, n]
+        if n > 1:
+            relative = position.unsqueeze(1) - position.unsqueeze(2)                     # [B, n, n, 2]  relative[:, i, j] = p_j - p_i
+            distance = torch.linalg.norm(relative, dim=-1) + 1e6 * torch.eye(n, device=position.device)   # not the car itself
+            nearest = distance.argmin(dim=-1)                                            # [B, n]
+            to_nearest = relative.gather(2, nearest[..., None, None].expand(-1, -1, 1, 2)).squeeze(2)   # [B, n, 2]
         else:
-            # per car (shared weights): own w_in, goal and target heading (as the MLP), plus the current state:
-            # goal relative to the car, heading error, nearest other car relative to the car
-            n = self.n_agents
-            car = input_t.view(batch_size, n, 7)                              # measured state per car
-            position, theta = car[..., 0:2], car[..., 2]                      # [B, n, 2], [B, n]
-            goal, target = xbar.view(batch_size, n, 2), theta_ref.view(batch_size, n)
-            to_goal = goal - position                                         # [B, n, 2]
-            heading_error = target - theta                                    # [B, n]
-            if n > 1:
-                relative = position.unsqueeze(1) - position.unsqueeze(2)      # [B, n, n, 2]  relative[:, i, j] = p_j - p_i
-                distance = torch.linalg.norm(relative, dim=-1) + 1e6 * torch.eye(n, device=position.device)   # not the car itself
-                nearest = distance.argmin(dim=-1)                             # [B, n]
-                to_nearest = relative.gather(2, nearest[..., None, None].expand(-1, -1, 1, 2)).squeeze(2)   # [B, n, 2]
-            else:
-                to_nearest = torch.zeros_like(position)                       # no other car
-            features = torch.cat((
-                w_in.view(batch_size, n, 8),
-                goal, torch.sin(target).unsqueeze(-1), (1 - torch.cos(target)).unsqueeze(-1),
-                to_goal, torch.sin(heading_error).unsqueeze(-1), (1 - torch.cos(heading_error)).unsqueeze(-1),
-                to_nearest,
-            ), dim=-1)                                                        # [B, n, 18]
-            if self.m2_hidden is None:                                        # first step of the rollout: memory 0
-                self.m2_hidden = torch.zeros(batch_size * n, self.M2.dim_hidden, device=features.device, dtype=features.dtype)
-            gain, self.m2_hidden = self.M2.forward(features.view(batch_size * n, -1), self.m2_hidden)
-            output_M2 = gain.view(batch_size, 1, 2 * n)                       # (dX, dY) gain per car
+            to_nearest = torch.zeros_like(position)                                      # no other car
+        features = torch.cat((
+            w_in,
+            goal, torch.sin(target).unsqueeze(-1), (1 - torch.cos(target)).unsqueeze(-1),
+            to_goal, torch.sin(heading_error).unsqueeze(-1), (1 - torch.cos(heading_error)).unsqueeze(-1),
+            to_nearest,
+        ), dim=-1)                                                                        # [B, n, 18]
+        if self.m2_hidden is None and self.m2_type == "gru":                             # first step: GRU memory 0
+            self.m2_hidden = torch.zeros(B * n, self.M2.dim_hidden, device=features.device, dtype=features.dtype)
+        gain, self.m2_hidden = self.M2.forward(features.view(B * n, 18), self.m2_hidden)
+        gain = gain.view(B, n, 2)                                                         # bounded gain per car
 
-        output = output_REN*output_M2*self.output_amplification   # shape = (self.batch_size, 1, self.dim_out)
+        # 7) offset per car, back to the plant's layout [B, 1, 2*n]
+        dxref = m1 * gain                                                                 # [B, n, 2]
+        output = dxref.view(B, 1, 2 * n)
         #output = torch.clamp(output,min = -10,max = 10)
         # update internal states
         self.last_input, self.last_output, self.last_xbar = input_t, output, xbar
