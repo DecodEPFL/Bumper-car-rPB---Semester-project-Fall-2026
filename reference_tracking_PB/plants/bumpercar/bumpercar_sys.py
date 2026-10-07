@@ -24,9 +24,13 @@ class PositionPidController(torch.nn.Module):
         params,
         n_agents,
         dt,
+        turn_speed=None,
     ):
         super().__init__()
 
+        # speed command [m/s] while the car does not face its target (e.g. the target is behind it):
+        # None = constant 0.1 m/s; a value v -> min(kp_p * distance, v): fast turns far from the target, slow near it
+        self.turn_speed = turn_speed
         self.kp_p = kp_p
         self.ki_p = ki_p
         self.kd_p = kd_p
@@ -107,21 +111,17 @@ class PositionPidController(torch.nn.Module):
             + self.kd_theta * d_error_theta
         )
 
-        dir_to_goal = error_vec / (error_pos.unsqueeze(-1) + 1e-6)
-        vel_vector = torch.stack(
-            [
-                vf * torch.cos(theta),
-                vf * torch.sin(theta),
-            ],
-            dim=-1,
-        )
-        v_along_goal = torch.sum(vel_vector * dir_to_goal, dim=-1)
-
-        v_ref = torch.where(
-            v_along_goal < 0,
-            torch.full_like(v_ref, 0.1),
-            v_ref,
-        )
+        # not facing the target: turn at a limited speed
+        if self.turn_speed is None:
+            v_away = torch.full_like(v_ref, 0.1)
+        else:
+            # capped by the normal P-command, so a car that just overshot its goal still creeps back slowly
+            v_away = torch.minimum(self.kp_p * error_pos, torch.full_like(v_ref, self.turn_speed))
+        # continuous in the angle between heading and target direction: P-speed when facing the target (angle 0),
+        # turn speed when sideways or behind (angle >= 90 deg), blended in between. From the heading, not from the
+        # sign of the velocity -> no jump in the speed command and no switching back and forth near standstill
+        facing = torch.clamp(torch.cos(error_theta), min=0.0)                   # 1 facing, 0 at >= 90 deg
+        v_ref = facing * v_ref + (1 - facing) * v_away
 
         drive_accel = (v_ref / self.par.max_speed) * 0.62 + 0.05
         drive_accel = torch.clamp(drive_accel, 0.0, 1.0)
@@ -166,13 +166,14 @@ class BumpercarSystem(nn.Module):
         n_agents=2,
         dt=0.04,
         model_path=DEFAULT_MODEL_PATH,
+        turn_speed=None,
     ):
         super().__init__()
 
         self.positionPID = PositionPidController(
             kp_p=0.5, kd_p=0.0, ki_p=0.0,
             kp_theta=1.0, kd_theta=0.0, ki_theta=0.0,
-            params=params, n_agents=n_agents, dt=dt)
+            params=params, n_agents=n_agents, dt=dt, turn_speed=turn_speed)
         
         self.par = params
         self.n_agents = n_agents

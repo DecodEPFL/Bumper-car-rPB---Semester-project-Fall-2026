@@ -9,13 +9,28 @@ n_agents = args.n_agents
 # The other 4 states (v_f, beta_f, beta_r, delta) start and end at 0.
 SCENARIOS = {
     2: {
-        "start": [(-2.0, -2.5, 0.0), (2.0, -2.5, -torch.pi)],
-        # one goal: one (x, y, theta) per car. Or a list of goals visited in order, each a list with one pose per car;
-        # every goal is a pose (position and heading at the end of its leg), the horizon is split into equal legs.
-        # Goal-and-back:
-        "goal": [[(2.0, 4.5, torch.pi / 2), (-2.0, 4.5, torch.pi / 2)],        # goal 1: car 1, car 2
-                 [(-2.0, -2.5, 0.0), (2.0, -2.5, -torch.pi)]],                # goal 2: back to the start poses
-        # single goal: "goal": [(2.0, 4.5, torch.pi / 2), (-2.0, 4.5, torch.pi / 2)],
+        # named poses (x, y, theta), shared by all cars: bottom/top, left/right
+        "poses": {"BL": (-2.0, -2.5, 0.0), "BR": (2.0, -2.5, -torch.pi),
+                  "TL": (-2.0, 4.5, torch.pi / 2), "TR": (2.0, 4.5, torch.pi / 2)},
+        # missions: per car (start, goal of leg 1, goal of leg 2) as pose names; the horizon is split into equal legs.
+        # All missions are drawn equally often. The first mission is the nominal scenario (plots, report figures).
+        "missions": [
+            [("BL", "TR", "BL"), ("BR", "TL", "BR")],   # crossing goal-and-back (nominal)
+        ],
+        # single goal: crossing to the top, facing up
+        # "missions": [[("BL", "TR"), ("BR", "TL")]],
+        # "missions": [
+        #     [("BL", "TR", "BL"), ("BR", "TL", "BR")],   # crossing goal-and-back (nominal)
+        #     [("BL", "TL", "BL"), ("BR", "TR", "BR")],   # parallel goal-and-back (each car stays on its side)
+        #     [("BL", "TR", "BL"), ("BR", "BR", "BR")],   # one car drives goal-and-back, the other is parked
+        #     [("TR", "BL", "BL"), ("TL", "BR", "BR")],   # return only (start at the top)
+        #     [("TR", "BL", "BL"), ("TL", "TL", "TL")],   # one car returns alone, the other is parked at the top
+        #     [("BL", "BL", "TR"), ("BR", "TL", "TL")],   # staggered: one car waits a leg, then drives up
+        # ],
+        # single scenario instead of missions: "start": one pose per car; "goal": one pose per car, or a list of goals
+        # visited in order (each a list with one pose per car), e.g.
+        # "start": [(-2.0, -2.5, 0.0), (2.0, -2.5, -torch.pi)],
+        # "goal": [[(2.0, 4.5, torch.pi / 2), (-2.0, 4.5, torch.pi / 2)], [(-2.0, -2.5, 0.0), (2.0, -2.5, -torch.pi)]],
     },
     # TODO: placeholder 3-car scenario (car 3 drives top -> bottom through the gap); define the real one.
     3: {
@@ -41,11 +56,38 @@ def _goal_list(scenario):
     return [goal] if single_goal else list(goal)
 
 
+def getMissions():
+    """Named poses {name: (x, y, theta)} and the missions of the scenario: each mission is a list with one
+    (start, goal of leg 1, goal of leg 2, ...) of pose names per car, as listed in the scenario.
+    A scenario without "missions" (only "start" and "goal") is one mission."""
+    scenario = SCENARIOS[n_agents]
+    if "missions" not in scenario:
+        goals = _goal_list(scenario)
+        poses = {f"start{i}": pose for i, pose in enumerate(scenario["start"])}
+        poses.update({f"goal{k}_{i}": pose for k, goal in enumerate(goals) for i, pose in enumerate(goal)})
+        mission = [tuple([f"start{i}"] + [f"goal{k}_{i}" for k in range(len(goals))]) for i in range(n_agents)]
+        return poses, [mission]
+    missions = [list(mission) for mission in scenario["missions"]]
+    for mission in missions:
+        assert len(mission) == n_agents and len({len(car) for car in mission}) == 1, "one (start, goals...) per car, same number of legs"
+    return scenario["poses"], missions
+
+
+def _nominal_start_and_goals():
+    """Nominal start poses and goals (one list of poses per leg) of the scenario: its first mission."""
+    poses, missions = getMissions()
+    mission = missions[0]
+    start = [poses[car[0]] for car in mission]
+    goals = [[poses[car[leg]] for car in mission] for leg in range(1, len(mission[0]))]
+    return start, goals
+
+
 def getCarInitParams(device):
     if n_agents not in SCENARIOS:
         raise ValueError(f"No scenario defined for n_agents={n_agents}; add one to SCENARIOS in experiment_params.py")
-    x0_bumpercar = _poses_to_state(SCENARIOS[n_agents]["start"])
-    x_final = _poses_to_state(_goal_list(SCENARIOS[n_agents])[-1])    # the last goal
+    start, goals = _nominal_start_and_goals()
+    x0_bumpercar = _poses_to_state(start)
+    x_final = _poses_to_state(goals[-1])                                # the last goal
 
     obstacle_centers = [torch.tensor([center], device=device) for center in OBSTACLES["centers"]]
     obstacle_covs = [torch.tensor([OBSTACLES["cov"]], device=device)] * len(obstacle_centers)
@@ -56,9 +98,10 @@ def getCarInitParams(device):
     return x0_bumpercar, x_final, obstacle_centers, obstacle_covs, car_init_radius, start_heading_range
 
 def getGoalSequence():
-    """Goals of the scenario in visiting order: one flat state [x, y, theta, 0, 0, 0, 0] per car for each goal
+    """Nominal goals (first mission) in visiting order: one flat state [x, y, theta, 0, 0, 0, 0] per car for each goal
     (a single goal: a list of one)."""
-    return [_poses_to_state(goal) for goal in _goal_list(SCENARIOS[n_agents])]
+    _, goals = _nominal_start_and_goals()
+    return [_poses_to_state(goal) for goal in goals]
 
 
 def getCarFinalParams():
@@ -100,7 +143,11 @@ def getExtraLossParams():
         alpha_heading=args.alpha_heading,
         alpha_heading_final=args.alpha_heading_final,
         heading_radius=args.heading_radius,
-        heading_final_steps=args.heading_final_steps,
+        goal_window_steps=args.goal_window_steps,
         alpha_offset_final=args.alpha_offset_final,
         obst_safe_dist=args.obst_safe_dist,
+        alpha_bounds=args.alpha_bounds,
+        alpha_corridor=args.alpha_corridor,
+        corridor_radius=args.corridor_radius,
+        alpha_smooth=args.alpha_smooth,
     )

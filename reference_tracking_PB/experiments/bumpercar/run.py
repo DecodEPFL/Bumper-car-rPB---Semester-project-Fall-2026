@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(1, BASE_DIR)
 
-from experiment_params import getCarFinalParams, getCarInitParams, getLossParams, getExtraLossParams, getGoalSequence, SCENARIOS, OBSTACLES
+from experiment_params import getCarFinalParams, getCarInitParams, getLossParams, getExtraLossParams, getGoalSequence, getMissions, SCENARIOS, OBSTACLES
 from controllers.MLP import ZeroController
 from config import device
 from arg_parser import argument_parser, print_args
@@ -62,7 +62,8 @@ def main():
     nx = 7 * n_agents
     x0_bumpercar,x_final_bumpercar, obstacle_centers, obstacle_covs, car_init_radius, start_heading_range = getCarInitParams(device)
     x_final_limit, y_final_limit, final_car_min_dist = getCarFinalParams()
-    
+    poses, missions = getMissions()
+
     dataset = BumpercarDataset(
         random_seed=args.random_seed,
         horizon=args.horizon,
@@ -75,7 +76,8 @@ def main():
         start_heading_range=start_heading_range,
         n_agents=n_agents,
         goal_heading_range=args.goal_heading_range * torch.pi / 180,
-        goals=getGoalSequence(),                # from SCENARIOS: one goal, or several visited in order
+        poses=poses,
+        missions=missions,                      # from SCENARIOS: one mission drawn per sample
     )
     
 # divide to train and test
@@ -86,8 +88,12 @@ def main():
 # data for plots
     t_ext = args.horizon * 4
 
-    plot_data = test_data[250:350, :, :].clone() 
+    # nominal scenario (first mission, no random offsets): nominal start, nominal goals switched per leg as in the dataset
+    plot_data = torch.zeros(1, args.horizon, 2 * nx)
     plot_data[:, 0, :nx] = dataset.x0.detach()
+    leg_ends = dataset.leg_starts[1:] + [args.horizon]
+    for goal, start, end in zip(getGoalSequence(), dataset.leg_starts, leg_ends):
+        plot_data[:, start:end, nx:] = goal.view(1, 1, -1)
     plot_data = plot_data.to(device)
 
 # batch the data
@@ -102,7 +108,8 @@ def main():
         x_init=plant_state_init,
         u_init=plant_input_init,
         n_agents=n_agents,
-        dt=0.04
+        dt=0.04,
+        turn_speed=args.turn_speed,
     ).to(device)
 
 # ------------ 3. Controller ------------
@@ -115,20 +122,25 @@ def main():
     initialization_std=args.cont_init_std,
     output_amplification=1,
     ren_internal_state_init=None,
-    clock_tau=args.ren_clock_tau,
     dt=sys.dt,
     ref_trace_tau=args.ren_ref_trace_tau,
+    m2_type=args.m2,
+    m2_gain_bound=args.m2_gain_bound,
 ).to(device)
 
+    warm_optimizer_state = None   # Adam state of the loaded run (only if the whole controller was loaded)
     if args.load_controller is not None:
         ckpt = torch.load(args.load_controller, map_location=device)
         if "controller_state_dict" in ckpt:
             current_state = ctl.state_dict()
+            # older checkpoints store M2 as "MLP.*"
+            stored_state = {("M2." + k[len("MLP."):] if k.startswith("MLP.") else k): v
+                            for k, v in ckpt["controller_state_dict"].items()}
             controller_state = {
-                k: v for k, v in ckpt["controller_state_dict"].items()
+                k: v for k, v in stored_state.items()
                 if k in current_state and current_state[k].shape == v.shape
             }
-            skipped = sorted(set(ckpt["controller_state_dict"].keys()) - set(controller_state.keys()))
+            skipped = sorted(set(stored_state.keys()) - set(controller_state.keys()))
             ctl.load_state_dict(controller_state, strict=False)
         elif "ren_state_dict" in ckpt:
             current_state = ctl.c_ren.state_dict()
@@ -138,8 +150,9 @@ def main():
             }
             skipped = sorted(set(ckpt["ren_state_dict"].keys()) - set(ren_state.keys()))
             ctl.c_ren.load_state_dict(ren_state, strict=False)
-            if "mlp_state_dict" in ckpt:
-                ctl.MLP.load_state_dict(ckpt["mlp_state_dict"], strict=False)
+            m2_state = ckpt.get("m2_state_dict", ckpt.get("mlp_state_dict"))   # older checkpoints: "mlp_state_dict"
+            if m2_state is not None and args.m2 == ckpt.get("args", {}).get("m2", "mlp"):
+                ctl.M2.load_state_dict(m2_state, strict=False)
         else:
             current_state = ctl.c_ren.state_dict()
             ren_state = {
@@ -153,6 +166,8 @@ def main():
             f"[INFO] loaded compatible controller tensors from {args.load_controller}; "
             f"skipped {len(skipped)} incompatible/non-REN entries."
         )
+        if len(skipped) == 0 and "optimizer_state_dict" in ckpt:
+            warm_optimizer_state = ckpt["optimizer_state_dict"]
 
 
 # ------------ 4. Loss ------------
@@ -182,6 +197,14 @@ def main():
     valid_data = train_data      # use the entire train data for validation
     assert not (valid_data is None and args.return_best)
     optimizer = torch.optim.Adam(ctl.parameters(), lr=args.lr)
+    if warm_optimizer_state is not None:
+        # warm start: continue Adam's state of the loaded run (moment estimates, step count), so the first steps do not
+        # kick the controller out of its minimum. load_state_dict also restores the loaded run's learning rate -> set
+        # --lr explicitly (initial_lr: start of the schedule below)
+        optimizer.load_state_dict(warm_optimizer_state)
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] = args.lr
+        logger.info(f"[INFO] continued the optimizer state of the loaded run with learning rate {args.lr:.2e}")
 
     # learning-rate schedule over the epochs: constant, or decaying to lr * lr_end_factor at the last epoch
     lr_end = args.lr * args.lr_end_factor
@@ -210,6 +233,10 @@ def main():
 
     logger.info('\n------------ Begin training ------------')
     best_valid_loss = 1e6
+    best_epoch = 0   # epoch of the best validation loss (early stopping)
+    assert args.patience_epoch is None or args.return_best, "early stopping needs --return-best (validation loss)"
+    # loss history at the logged epochs, for loss_curves.pdf
+    history = {"epoch": [], "train": [], "valid": [], "valid_terms": {}}
     t = time.time()
     for epoch in range(1 + args.epochs):
         max_grad_norm = 0.0   # largest gradient norm (before clipping) in this epoch
@@ -246,18 +273,20 @@ def main():
                 loss_valid_value = loss_valid.item()
                 msg += ' ---||--- validation loss: %.2f' % loss_valid_value
                 msg += ' [' + ', '.join('%s %.2f' % (name, value) for name, value in loss_fn.last_terms.items()) + ']'
+                valid_terms = dict(loss_fn.last_terms)
                 # compare with the best valid loss
                 if loss_valid_value < best_valid_loss:
                     best_valid_loss = loss_valid_value
                     best_params_ren = ctl.get_parameters_as_vector()  # record state dict if best on valid
-                    best_params_mlp = ctl.get_mlp_parameters()
+                    best_params_m2 = ctl.get_m2_parameters()
                     is_best = True
+                    best_epoch = epoch
                     msg += ' (best so far)'
             checkpoint = {
                 "epoch": epoch,
                 "controller_state_dict": ctl.state_dict(),
                 "ren_state_dict": ctl.c_ren.state_dict(),
-                "mlp_state_dict": ctl.MLP.state_dict(),
+                "m2_state_dict": ctl.M2.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "Q": Q,
                 "Q_final": Q_final,
@@ -277,7 +306,21 @@ def main():
             msg += ' ---||--- time: %.0f s' % (duration)
             msg += f' ---||--- checkpoint: {checkpoint_epoch_file}'
             logger.info(msg)
+
+            # loss curves so far (redrawn at every logged epoch, so a stopped run has them too)
+            history["epoch"].append(epoch)
+            history["train"].append(loss.detach().item())
+            if loss_valid_value is not None:
+                history["valid"].append(loss_valid_value)
+                for name, value in valid_terms.items():
+                    history["valid_terms"].setdefault(name, []).append(value)
+            plot_loss_curves(history, save_folder, 'loss_curves.pdf')
             t = time.time()
+
+            # early stopping: no validation improvement for patience_epoch epochs
+            if args.patience_epoch is not None and epoch - best_epoch >= args.patience_epoch:
+                logger.info('[INFO] early stopping at epoch %i: no validation improvement since epoch %i.' % (epoch, best_epoch))
+                break
 
         if scheduler is not None:
             scheduler.step()   # once per epoch
@@ -285,7 +328,7 @@ def main():
     # set to best seen during training
     if args.return_best:
         ctl.set_parameters_as_vector(best_params_ren)
-        ctl.set_mlp_parameters(best_params_mlp)
+        ctl.set_m2_parameters(best_params_m2)
 
 # ------ 7. Save and evaluate the trained model ------
 # save
@@ -350,6 +393,30 @@ def plot_closed_loop(x, ref, save_folder, filename, text, loss_fn, T, x_baseline
         obstacle_centers=loss_fn.obstacle_centers, obstacle_covs=loss_fn.obstacle_covs,
         earlier_goals=earlier_goals, x_baseline=x_baseline,
     )
+
+
+def plot_loss_curves(history, save_folder, filename):
+    """Loss over the logged epochs: totals (train = last batch of the epoch, validation) and every validation loss term."""
+    epochs = history["epoch"]
+    fig, axs = plt.subplots(1, 2, figsize=(14, 5))
+    axs[0].plot(epochs, history["train"], label="train (last batch)", alpha=0.6)
+    if history["valid"]:
+        axs[0].plot(epochs, history["valid"], label="validation (train data)")
+    axs[0].set_title("total loss")
+    for name, values in history["valid_terms"].items():
+        if max(values) <= 1e-3:
+            continue   # terms that are off or ~0 (log scale)
+        axs[1].plot(epochs, values, label=name)
+    axs[1].set_title("validation loss terms")
+    axs[1].legend(fontsize=8, ncol=2)
+    for ax in axs:
+        ax.set_yscale("log")
+        ax.set_xlabel("epoch")
+        ax.grid(True, which="both", alpha=0.3)
+    axs[0].legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_folder, filename))
+    plt.close(fig)
 
 
 def plot_dxref_over_time(u, dt, n_agents, save_folder, filename):

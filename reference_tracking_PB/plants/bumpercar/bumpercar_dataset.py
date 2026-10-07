@@ -16,7 +16,8 @@ class BumpercarDataset(CostumDataset):
         final_car_min_dist=2,
         n_agents=2,
         goal_heading_range=0.0,
-        goals=None,
+        poses=None,
+        missions=None,
         leg_steps=None,
     ):
         exp_name = 'bumpercar'
@@ -35,9 +36,11 @@ class BumpercarDataset(CostumDataset):
         self.final_car_radius = final_car_radius
         self.start_heading_range = start_heading_range  # [rad] half-width of the start heading spread
         self.goal_heading_range = goal_heading_range    # [rad] half-width of the target heading spread; 0 = off
-        # goals visited in order (one flat 7*n_agents state each; default: the single goal x_final), one leg each
-        self.goals = list(goals) if goals is not None else [x_final]
-        self.leg_starts, self.goal_leg_ends, self.final_leg_start = self.goal_schedule(horizon, len(self.goals), leg_steps)
+        # missions (experiment_params.getMissions): named poses {name: (x, y, theta)} and a list of missions, each with one
+        # (start, goal of leg 1, goal of leg 2, ...) of pose names per car; one mission is drawn per sample
+        self.poses, self.missions = poses, missions
+        self.n_legs = len(missions[0][0]) - 1
+        self.leg_starts, self.goal_leg_ends, self.final_leg_start = self.goal_schedule(horizon, self.n_legs, leg_steps)
 
     @staticmethod
     def goal_schedule(horizon, n_goals, leg_steps=None):
@@ -90,29 +93,34 @@ class BumpercarDataset(CostumDataset):
         data = torch.zeros(num_samples, self.horizon, state_dim)
 
         for rollout_num in range(num_samples):
-            x0_sample = self.x0.clone()
-            noise = torch.zeros_like(self.x0)
-            goal_samples = [goal.clone() for goal in self.goals]
+            # mission of this sample (all missions equally likely): one (start, goal of leg 1, ...) of pose names per car
+            mission = self.missions[torch.randint(len(self.missions), ()).item()]
+            x0_sample = torch.zeros(state_dim_x0)
+            goal_samples = [torch.zeros(state_dim_x0) for _ in range(self.n_legs)]
 
-            for i in range(self.n_agents):
+            for i, names in enumerate(mission):
                 base = 7 * i
-                noise[base:base + 2] = self.sample_uniform_disk(
-                    self.car_init_radius,
-                    self.x0.device,
-                )
-                noise[base + 2] = self.start_heading_range * (2 * torch.rand(()) - 1)    # symmetric: U(-range, range)
-                # every goal: its own random position offset, and its own target-heading offset if enabled
-                for goal_sample in goal_samples:
-                    goal_sample[base:base + 2] += self.sample_uniform_disk(
-                        self.final_car_radius,
-                        self.x0.device,
-                    )
-                    # target heading: scenario heading + U(-range, range), wrapped to (-pi, pi]
-                    if self.goal_heading_range > 0:     # no random draw when off, so existing datasets stay identical
-                        heading = goal_sample[base + 2] + self.goal_heading_range * (2 * torch.rand(()) - 1)
-                        goal_sample[base + 2] = torch.atan2(torch.sin(heading), torch.cos(heading))
+                # start: nominal pose + position offset (disk) + heading offset U(-range, range)
+                start = torch.tensor(self.poses[names[0]], dtype=torch.float32)
+                start[0:2] += self.sample_uniform_disk(self.car_init_radius, start.device)
+                start[2] += self.start_heading_range * (2 * torch.rand(()) - 1)
+                x0_sample[base:base + 3] = start
+                # goals: the same pose name as in the previous position is the same pose (parked: the goal is the
+                # sampled start; staying: the goal of the previous leg); any other pose gets its own random offset
+                previous_name, previous_pose = names[0], start
+                for leg, name in enumerate(names[1:]):
+                    if name == previous_name:
+                        goal = previous_pose
+                    else:
+                        goal = torch.tensor(self.poses[name], dtype=torch.float32)
+                        goal[0:2] += self.sample_uniform_disk(self.final_car_radius, goal.device)
+                        # target heading: pose heading + U(-range, range), wrapped to (-pi, pi]
+                        if self.goal_heading_range > 0:
+                            heading = goal[2] + self.goal_heading_range * (2 * torch.rand(()) - 1)
+                            goal[2] = torch.atan2(torch.sin(heading), torch.cos(heading))
+                    goal_samples[leg][base:base + 3] = goal
+                    previous_name, previous_pose = name, goal
 
-            x0_sample = x0_sample + noise
             data[rollout_num, 0, :state_dim_x0] = x0_sample
 
             # reference: the goals in visiting order, each during its leg (the last goal until the end of the horizon)

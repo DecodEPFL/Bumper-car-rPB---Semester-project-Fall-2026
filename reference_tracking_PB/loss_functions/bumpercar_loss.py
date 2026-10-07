@@ -14,9 +14,12 @@ class BumpercarLoss(LQLossFH):
         position_deadzone=0.0,
         steady_state_velocity_radius=None,
         alpha_heading=0.0, alpha_heading_final=0.0,
-        heading_radius=0.5, heading_final_steps=50,
+        heading_radius=0.5, goal_window_steps=50,
         alpha_offset_final=0.0,
         goal_leg_ends=None, final_leg_start=0,
+        alpha_bounds=0.0,
+        alpha_corridor=0.0, corridor_radius=2.0,
+        alpha_smooth=0.0,
     ):
         super().__init__(Q=Q, R=alpha_u, loss_bound=loss_bound, sat_bound=sat_bound, xbar=None)
         self.Qs = Qs
@@ -26,8 +29,15 @@ class BumpercarLoss(LQLossFH):
         self.position_deadzone = position_deadzone
         self.steady_state_velocity_radius = steady_state_velocity_radius
         self.alpha_heading, self.alpha_heading_final = alpha_heading, alpha_heading_final
-        self.heading_radius, self.heading_final_steps = heading_radius, heading_final_steps
+        # arrival window: steps at the end of every goal leg over which final position and heading are averaged
+        self.heading_radius, self.goal_window_steps = heading_radius, goal_window_steps
         self.alpha_offset_final = alpha_offset_final
+        # smoothness: squared change of the rPB offset dxref per step (jumps of the tracked reference), weight alpha_smooth
+        self.alpha_smooth = alpha_smooth
+        # approach corridor: near the active goal, sideways offset from the line through the goal along theta*
+        # (arrive along the target heading); weight alpha_corridor (0 = off), soft mask of length scale corridor_radius
+        self.alpha_corridor, self.corridor_radius = alpha_corridor, corridor_radius
+        assert alpha_corridor == 0 or obst_safe_dist is not None   # the corridor is switched off inside obst_safe_dist
         # goal sequence: last step of each goal's leg (None: one goal, the end of the rollout) and the first step of the
         # last goal's leg (the speed term only acts there: earlier goals may be passed at speed)
         self.goal_leg_ends, self.final_leg_start = goal_leg_ends, final_leg_start
@@ -59,9 +69,10 @@ class BumpercarLoss(LQLossFH):
         # mask
         self.mask = torch.logical_not(torch.eye(self.n_agents, device=device))   # shape = (n_agents, n_agents)
 
+        # arena: cost for a car closer than arena_margin to the edge (quadratic in the depth), weight alpha_bounds (0 = off)
         self.arena_bounds = ((-3.5, 3.5), (-4.0, 6.0))
         self.arena_margin = 0.4  # car radius / safety buffer
-        self.alpha_bounds = 1e4 * 0  # tune relative to alpha_obst
+        self.alpha_bounds = alpha_bounds
 
         assert self.Q.shape[0] == 7 * self.n_agents
         assert self.Q_final.shape == self.Q.shape
@@ -98,12 +109,12 @@ class BumpercarLoss(LQLossFH):
             e_batch
         )   # shape = (S, T, 1, 1)
         loss_x = torch.sum(xTQx, 1) / e_batch.shape[1]   # average over the time horizon. shape = (S, 1, 1)
-        # final position: averaged over the last heading_final_steps steps of every goal's leg (the car has to be at
+        # final position: averaged over the arrival window (last goal_window_steps steps) of every goal's leg (the car has to be at
         # the goal during that whole window, not only at its last step), summed over the goals
         goal_leg_ends = self.goal_leg_ends if self.goal_leg_ends is not None else [e_batch.shape[1] - 1]
         loss_x_final = 0
         for end in goal_leg_ends:
-            e_window = e_batch[:, end - self.heading_final_steps + 1:end + 1]           # [S, K, nx, 1]
+            e_window = e_batch[:, end - self.goal_window_steps + 1:end + 1]           # [S, K, nx, 1]
             eTQe = torch.matmul(torch.matmul(e_window.transpose(-1, -2), self.Q_final), e_window)   # [S, K, 1, 1]
             loss_x_final = loss_x_final + eTQe.mean(1)                                # (S, 1, 1)
 
@@ -129,22 +140,47 @@ class BumpercarLoss(LQLossFH):
         near_goal = torch.exp(-distance_to_goal**2 / (2 * self.heading_radius**2))   # 1 at the goal, 0.61 at r, 0.14 at 2r
         loss_heading = self.alpha_heading * (heading_cost * near_goal).sum((1, 2)) / es.shape[1]      # [S]
 
-        # terminal term: average over the last heading_final_steps steps of every goal's leg, summed over cars and goals
+        # terminal term: average over the arrival window of every goal's leg, summed over cars and goals
         loss_heading_final = 0
         for end in goal_leg_ends:
-            final_cost = heading_cost[:, end - self.heading_final_steps + 1:end + 1, :]   # [S, K, n_agents]
+            final_cost = heading_cost[:, end - self.goal_window_steps + 1:end + 1, :]   # [S, K, n_agents]
             loss_heading_final = loss_heading_final + self.alpha_heading_final * final_cost.sum(-1).mean(-1)   # [S]
 
         loss_heading = loss_heading.reshape(-1, 1, 1)
         loss_heading_final = loss_heading_final.reshape(-1, 1, 1)
 
+        # approach corridor: sideways offset from the line through the active goal along theta* (on that line, driving to
+        # the goal = arriving with heading theta*); only near the goal and only outside the obstacles' safety zones
+        if self.alpha_corridor > 0:
+            theta_ref = xs[:, :, 2::7] + heading_error                            # [S, T, n_agents]  theta* (e = ref - x)
+            lateral = (position_error[..., 0] * torch.sin(theta_ref)
+                       - position_error[..., 1] * torch.cos(theta_ref))           # [S, T, n_agents]  signed offset from the line
+            # where the term counts: 1 at the goal, 0.61 at R, 0.14 at 2R; detached -> a weight only, so its gradient
+            # does not push the car away from the goal (only the lateral offset is penalized)
+            corridor_weight = torch.exp(-distance_to_goal**2 / (2 * self.corridor_radius**2)).detach()
+            # obstacle priority: 0 within obst_safe_dist of any obstacle (only the obstacle term acts there)
+            car_position = xs.reshape(xs.shape[0], xs.shape[1], self.n_agents, 7)[..., 0:2]   # [S, T, n_agents, 2]
+            for center in self.obstacle_centers:
+                outside = torch.linalg.norm(car_position - center.view(1, 1, 1, 2), dim=-1) >= self.obst_safe_dist
+                corridor_weight = corridor_weight * outside                       # [S, T, n_agents]
+            loss_corridor = self.alpha_corridor * (lateral**2 * corridor_weight).sum((1, 2)) / es.shape[1]   # [S]
+            loss_corridor = loss_corridor.reshape(-1, 1, 1)
+        else:
+            loss_corridor = 0
+
         # terminal offset: the rPB must have let go of the car by the end of the rollout,
         # so the pose the terminal terms see is the pose the car keeps afterwards
-        final_offset = us[:, -self.heading_final_steps:, :]                      # [S, K, 2*n_agents]  dxref
+        final_offset = us[:, -self.goal_window_steps:, :]                      # [S, K, 2*n_agents]  dxref
         loss_offset_final = self.alpha_offset_final * (final_offset**2).sum(-1).mean(-1)   # [S]
         loss_offset_final = loss_offset_final.reshape(-1, 1, 1)
 
         loss_bounds = self.alpha_bounds * self.f_loss_bounds(x_batch)
+
+        # smoothness: penalize how fast the rPB offset changes, not how large it is (large but smooth offsets, e.g. a
+        # hook, stay cheap; jumps of the tracked reference are expensive). A goal switch changes xbar, not dxref -> free
+        offset_rate = us[:, 1:, :] - us[:, :-1, :]                            # [S, T-1, 2*n_agents]  change of dxref per step
+        loss_smooth = self.alpha_smooth * (offset_rate**2).sum(-1).sum(1) / us.shape[1]   # [S]
+        loss_smooth = loss_smooth.reshape(-1, 1, 1)
         
         
         # loss control actions = 1/T sum_{t=1}^T u_t^T R u_t
@@ -176,11 +212,14 @@ class BumpercarLoss(LQLossFH):
             "heading": sample_mean(loss_heading),
             "heading_final": sample_mean(loss_heading_final),
             "offset_final": sample_mean(loss_offset_final),
+            "bounds": sample_mean(loss_bounds),
+            "corridor": sample_mean(loss_corridor),
+            "smooth": sample_mean(loss_smooth),
         }
 
         # sum up all losses
         loss_val = (loss_x + loss_x_final + loss_u + loss_ca + loss_obst + loss_speed + loss_bounds
-                    + loss_heading + loss_heading_final + loss_offset_final)          # shape = (S, 1, 1)
+                    + loss_heading + loss_heading_final + loss_offset_final + loss_corridor + loss_smooth)   # shape = (S, 1, 1)
         # bound
         if self.sat_bound is not None:
             loss_val = torch.tanh(loss_val/self.sat_bound)  # shape = (S, 1, 1)
