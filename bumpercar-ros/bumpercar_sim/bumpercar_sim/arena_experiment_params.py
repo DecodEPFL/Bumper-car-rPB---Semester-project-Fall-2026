@@ -21,23 +21,24 @@ else:
 
 
 def getCarInitParams(device):
+    # Aligned with reference_tracking_PB/experiment_params.py
     x0_bumpercar = torch.tensor([
-            -2.5, -2.5, torch.pi/2, 0.0, 0.1, 0.3, 0.5,   # car 1
-            2.5, -2.5, torch.pi/2, 0.0, 0.1, 0.3, 0.5,   # car 2
+            -2.0, -2.5, 0.0, 0.0, 0.0, 0.0, 0.0,         # car 1: pos (-2, -2.5), theta 0
+            2.0, -2.5, -torch.pi, 0.0, 0.0, 0.0, 0.0,    # car 2: pos (2, -2.5), theta -pi
         ], device=device)
 
     x_final = torch.tensor([
-            2.5, 3.0, torch.pi/2, 0.0, 0.1, 0.3, 0.5,   # car 1
-            -2.5, 3.0, torch.pi/2, 0.0, 0.1, 0.3, 0.5,   # car 2
+            2.0, 3.0, torch.pi/2, 0.0, 0.0, 0.0, 0.0,    # car 1: goal (2, 3)
+            -2.0, 3.0, torch.pi/2, 0.0, 0.0, 0.0, 0.0,   # car 2: goal (-2, 3)
         ], device=device)
 
     obstacle_centers = [
-        torch.tensor([[-1.375, 0.0]], device=device),
-        torch.tensor([[1.375, 0.0]], device=device),
+        torch.tensor([[-2.0, 0.0]], device=device),
+        torch.tensor([[2.0, 0.0]], device=device),
     ]
-    obstacle_covs = [torch.tensor([[0.10, 0.10]], device=device)] * len(obstacle_centers)
+    obstacle_covs = [torch.tensor([[0.44, 0.44]], device=device)] * len(obstacle_centers)
 
-    car_init_radius = 1.0
+    car_init_radius = 0.3
     std_init_theta = STD_INIT_THETA
 
     return x0_bumpercar, x_final, obstacle_centers, obstacle_covs, car_init_radius, std_init_theta

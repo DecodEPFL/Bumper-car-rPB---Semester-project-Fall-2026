@@ -49,17 +49,41 @@ class PBControllerNode(Node):
         self.declare_parameter("checkpoint_path", pRB_model_path)
         checkpoint_path = str(self.get_parameter("checkpoint_path").value)
 
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        ckpt_args = checkpoint.get("args", {})
+        if not isinstance(ckpt_args, dict):
+            ckpt_args = vars(ckpt_args)
+
+        dim_internal = ckpt_args.get("dim_internal", 8)
+        dim_nl = ckpt_args.get("dim_nl", 8)
+        cont_init_std = ckpt_args.get("cont_init_std", 0.1)
+
         self.controller = PerfBoostController(
             noiseless_forward=self.system.noiseless_forward,
             input_init=self.system.x_init,
             output_init=self.system.u_init,
-            dim_internal=args.get("dim_internal", 8),
-            dim_nl=args.get("dim_nl", 8),
-            initialization_std=args.get("cont_init_std", 0.1),
+            dim_internal=dim_internal,
+            dim_nl=dim_nl,
+            initialization_std=cont_init_std,
             output_amplification=1,
             ren_internal_state_init=None,
         ).to(device)
-        self.controller.load_state_dict(checkpoint_path)
+
+        if "controller_state_dict" in checkpoint:
+            self.controller.load_state_dict(checkpoint["controller_state_dict"], strict=False)
+        elif "ren_state_dict" in checkpoint:
+            self.controller.c_ren.load_state_dict(checkpoint["ren_state_dict"], strict=False)
+            if "mlp_state_dict" in checkpoint:
+                self.controller.MLP.load_state_dict(checkpoint["mlp_state_dict"], strict=False)
+        else:
+            ren_state = {
+                key: value for key, value in checkpoint.items()
+                if key in self.controller.c_ren.state_dict()
+            }
+            self.controller.c_ren.load_state_dict(ren_state, strict=False)
+
+        self.controller.eval()
+        self.controller.reset()
         
         self.system.positionPID.reset(
             batch_size=1,
@@ -68,7 +92,7 @@ class PBControllerNode(Node):
         )
 
         self.xbar = torch.tensor(
-            [[2.5, 3.0, -2.5, 3.0]],
+            [[2.0, 3.0, -2.0, 3.0]],
             dtype=torch.float32,
             device=device,
         )

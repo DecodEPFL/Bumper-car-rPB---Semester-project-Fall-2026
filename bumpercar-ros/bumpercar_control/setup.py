@@ -42,7 +42,7 @@ setup(
     extras_require={'test': ['pytest']},
     entry_points={
         'console_scripts': [
-            'mlp_controller = bumpercar_control.controller_node:main',
+            'mlp_controller = bumpercar_control.mlp_controller_node:main',
             'rpb_controller = bumpercar_control.rPB_controller_node:main',
         ],
     },
