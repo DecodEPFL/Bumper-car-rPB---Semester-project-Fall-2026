@@ -20,7 +20,7 @@ This folder trains and tests the rPB controller for the two-car scenario. It has
 |---|---|
 | **Train** | `python experiments/bumpercar/run.py` (Colab wrapper: `colab/train_bumpercar.ipynb`) |
 | **Evaluate / visualise** | `python sim.py` (loss, collisions, distance metrics, interactive plot, report figures) |
-| **Provided checkpoint** | `experiments/bumpercar/trained_pRB/rPB_best.pt` |
+| **Provided checkpoint** | `experiments/bumpercar/trained_rPB/rPB_best.pt` |
 
 In short, the controller outputs a correction `dxref` to each car's reference position, and a P-controller tracks that reference. The controller is a contractive REN driven by the reconstructed disturbance, multiplied by an MLP. It is trained by backpropagating through closed-loop rollouts of the learned dynamics.
 

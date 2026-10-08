@@ -59,7 +59,7 @@ The dataset is regenerated at the start of every run, and it is fully determined
 
 ### Reproducing the provided checkpoint
 
-The run that produced `experiments/bumpercar/trained_pRB/rPB_best.pt` took place on Colab. Its `log` was saved to Google Drive and is not in this repo. The settings below come from the metadata stored in the checkpoint (`args`, `Q`, `Q_final`, `epoch`, and the losses):
+The run that produced `experiments/bumpercar/trained_rPB/rPB_best.pt` took place on Colab. Its `log` was saved to Google Drive and is not in this repo. The settings below come from the metadata stored in the checkpoint (`args`, `Q`, `Q_final`, `epoch`, and the losses):
 
 | Setting | Value |
 |---|---|
@@ -98,7 +98,7 @@ python sim.py
 
 `sim.py` is configured through the constants at the top of the file, not through CLI flags:
 
-- `TRAINED_PBR_MODEL_PATH` is the checkpoint to load. The default is the provided `experiments/bumpercar/trained_pRB/rPB_best.pt`.
+- `TRAINED_RPB_MODEL_PATH` is the checkpoint to load. The default is the provided `experiments/bumpercar/trained_rPB/rPB_best.pt`.
 - `EVAL_*` set the number of rollouts, the horizon and the seed for `evaluate_controller()`. It prints the train/test loss, collision counts and obstacle hits.
 - `SIM_*` choose the rollout that the interactive slider plot (`show_simulation()`) displays.
 - `evaluate_rollout_metrics()` reports steady-state error and minimum car–car and car–obstacle distances. The `save_*_figure` and `save_trajectory_gif` functions produce the report figures in `experiments/bumpercar/figs/`.
@@ -192,7 +192,7 @@ reference_tracking_PB/
 └── experiments/bumpercar/
     ├── run.py                 # TRAINING entry point
     ├── arg_parser.py          # CLI flags for run.py
-    ├── trained_pRB/rPB_best.pt  # provided trained controller (full checkpoint)
+    ├── trained_rPB/rPB_best.pt  # provided trained controller (full checkpoint)
     └── figs/                  # report figures of the provided controller
 ```
 

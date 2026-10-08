@@ -39,7 +39,7 @@ from utils.plot_functions import agent_color
 
 
 # Checkpoint to evaluate: --checkpoint <path>, default the provided one.
-TRAINED_PBR_MODEL_PATH = ARGS.checkpoint or os.path.join(BASE_DIR, "experiments/bumpercar/trained_pRB/rPB_best.pt")
+TRAINED_RPB_MODEL_PATH = ARGS.checkpoint or os.path.join(BASE_DIR, "experiments/bumpercar/trained_rPB/rPB_best.pt")
 
 # Training settings of the evaluated run override sim.py's own flags: same car count, families, loss weights and
 # scenario as in training. Evaluation seeds, horizons and violation distances stay sim.py's own.
@@ -47,7 +47,7 @@ TRAINING_SETTINGS = ["n_agents", "families",
                      "alpha_u", "q_final_factor", "alpha_col", "alpha_obst", "min_dist", "obst_safe_dist",
                      "alpha_heading", "alpha_heading_final", "heading_radius", "goal_window_steps", "alpha_offset_final",
                      "alpha_bounds", "alpha_smooth", "turn_speed"]
-checkpoint = torch.load(TRAINED_PBR_MODEL_PATH, map_location="cpu", weights_only=False)
+checkpoint = torch.load(TRAINED_RPB_MODEL_PATH, map_location="cpu", weights_only=False)
 stored_args = checkpoint.get("args", {})
 stored_args = stored_args if isinstance(stored_args, dict) else vars(stored_args)
 for name in TRAINING_SETTINGS:
@@ -95,7 +95,7 @@ def get_output_dir(checkpoint_path=None):
     - checkpoint of a training run (.../<run>/checkpoints/<name>.pt) -> <run>/sim/<name>_ep<epoch>/
     - any other checkpoint (e.g. the provided rPB_best.pt)             -> saved_results/sim_<name>_ep<epoch>/
     """
-    checkpoint_path = os.path.abspath(checkpoint_path or TRAINED_PBR_MODEL_PATH)
+    checkpoint_path = os.path.abspath(checkpoint_path or TRAINED_RPB_MODEL_PATH)
     checkpoint_dir = os.path.dirname(checkpoint_path)
     name = os.path.splitext(os.path.basename(checkpoint_path))[0]
     if checkpoint.get("epoch") is not None:
@@ -851,14 +851,14 @@ if __name__ == "__main__":
     tee = Tee(sys.stdout)
     sys.stdout = tee
     trained_families = stored_args.get("families")
-    print(f"[INFO] checkpoint: {TRAINED_PBR_MODEL_PATH}")
+    print(f"[INFO] checkpoint: {TRAINED_RPB_MODEL_PATH}")
     print(f"[INFO] outputs:    {get_output_dir()}")
     print(f"[RUN]  epoch {checkpoint.get('epoch')}, validation loss {checkpoint.get('validation_loss')}, "
           f"{N_AGENTS} cars, training horizon {TRAIN_HORIZON} steps ({TRAIN_HORIZON * DT:.0f} s), "
           f"trained on families: {'all of its scenario' if trained_families is None else ', '.join(trained_families)}")
 
     system = make_system()
-    controller = load_controller(system, TRAINED_PBR_MODEL_PATH)
+    controller = load_controller(system, TRAINED_RPB_MODEL_PATH)
     nominal = run_nominal(system, controller)
     test = run_test(system, controller)
     long = run_long_horizon(system, controller, test)

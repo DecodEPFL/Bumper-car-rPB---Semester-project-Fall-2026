@@ -52,7 +52,7 @@ def argument_parser():
     parser.add_argument('--return-best', action=argparse.BooleanOptionalAction, default=True, help='Return the best model on the validation data among all logged iterations. The train data can be used instead of validation data. The Default is True.')
     parser.add_argument('--load-controller', type=str, default=None, help='Optional path to a compatible trained controller checkpoint.')
     parser.add_argument('--current-scenario', action=argparse.BooleanOptionalAction, default=False, help='sim.py only: evaluate on the current SCENARIOS/OBSTACLES of experiment_params.py instead of the scenario stored in the checkpoint. Default is False.')
-    parser.add_argument('--checkpoint', type=str, default=None, help='sim.py only: checkpoint to evaluate. Default is the provided trained_pRB/rPB_best.pt.')
+    parser.add_argument('--checkpoint', type=str, default=None, help='sim.py only: checkpoint to evaluate. Default is the provided trained_rPB/rPB_best.pt.')
 
     # TODO: add the following
     # parser.add_argument('--lr-start-factor', type=float, default=1.0, help='Start factor of the linear learning rate scheduler. Default is 1.0.')
