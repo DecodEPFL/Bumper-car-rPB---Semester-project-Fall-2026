@@ -15,9 +15,7 @@ def argument_parser():
     parser.add_argument('--n-agents', type=int, default=2, help='Number of agents. Default is 2.')
     parser.add_argument('--turn-speed', type=float, default=0.6, help='Base P-controller: speed command [m/s] while a car moves away from its target (e.g. a new goal behind it), as min(kp * distance, turn_speed). Default is None (constant 0.1 m/s, the original rule).')
     parser.add_argument('--num-rollouts', type=int, default=800, help='Number of rollouts in the training data. Default is 400.')
-    parser.add_argument('--goal-heading-range', type=float, default=20.0, help='Target heading per car sampled uniformly within +-this many degrees around the scenario heading. Default is 0 (off: exactly the SCENARIOS heading).')
-    parser.add_argument('--start-radius', type=float, default=0.5, help='Start position per car sampled uniformly in a disk of this radius [m] around the scenario start. Default is 0.3.')
-    parser.add_argument('--start-heading-range', type=float, default=30.0, help='Start heading per car sampled uniformly within +-this many degrees around the scenario heading. Default is 10.')
+    parser.add_argument('--families', type=str, nargs='+', default=None, help='Scenario families of the training data (SCENARIOS in experiment_params.py), each drawn equally often, e.g. --families crossing_up crossing_down. Default is all families of the scenario.')
 
     # controller
     parser.add_argument('--cont-init-std', type=float, default=0.1, help='Initialization std for controller params. Default is 0.1.')
@@ -34,13 +32,13 @@ def argument_parser():
     parser.add_argument('--obst-safe-dist', type=float, default=1.7, help='Obstacle cost is 0 beyond this distance [m] from each obstacle center (Gaussian minus its value there, clipped at 0). Default is 1.7 (sim.py hit radius 1.5 + 0.2 margin).')
     parser.add_argument('--alpha-bounds', type=float, default=1e4, help='Weight of the arena loss: quadratic in how far a car center is inside the 1 m margin (car radius) of the arena edge (x in [-3.5, 3.5], y in [-4, 6]). Default is 1e4 (0 = off).')
     parser.add_argument('--min-dist', type=float, default=2.0, help='Minimum distance [m] between car centers; the collision loss is active below min_dist + 0.2. Default is 2.0 if "col-av" is True, else None.')
-    parser.add_argument('--q-final-factor', type=float, default=500, help='Terminal position weight: Q_final = this * Q (per car (2/15) * factor per m^2), averaged over the --goal-window-steps arrival window of every goal leg. Default is 570 (final position and final heading of similar weight: 10 cm ~ 10 deg).')
+    parser.add_argument('--q-final-factor', type=float, default=500, help='Terminal position weight: Q_final = this * Q (per car (2/15) * factor per m^2), averaged over the --goal-window-steps arrival window at the end of the rollout. Default is 500 (final position and final heading of similar weight: 10 cm ~ 10 deg).')
     parser.add_argument('--alpha-heading', type=float, default=50.0, help='Weight of the running heading loss 1 - cos(theta* - theta), weighted by exp(-d^2 / (2 * heading_radius^2)) with d the distance to the goal. Default is 50 (0 = off).')
-    parser.add_argument('--alpha-heading-final', type=float, default=50.0, help='Weight of the terminal heading loss over the --goal-window-steps arrival window of every goal leg. Default is 50 (0 = off).')
+    parser.add_argument('--alpha-heading-final', type=float, default=50.0, help='Weight of the terminal heading loss over the --goal-window-steps arrival window at the end of the rollout. Default is 50 (0 = off).')
     parser.add_argument('--heading-radius', type=float, default=0.75, help='Length scale [m] of the soft mask of the running heading loss (weight 0.61 at this distance from the goal). Default is 0.75.')
     parser.add_argument('--alpha-smooth', type=float, default=50.0, help='Weight of the smoothness loss: squared change of the rPB offset dxref per step, averaged over time (penalizes jumps of the tracked reference, not its size). Default is 50 (0 = off).')
     parser.add_argument('--alpha-offset-final', type=float, default=20.0, help='Weight of the squared rPB offset dxref over the last --goal-window-steps steps of the rollout (the car must have settled by the end). Default is 20 (0 = off).')
-    parser.add_argument('--goal-window-steps', type=int, default=50, help='Arrival window: number of time steps at the end of every goal leg over which the final position and heading losses are averaged (also the window of the offset loss at the end). Default is 50 (2 s at dt 0.04).')
+    parser.add_argument('--goal-window-steps', type=int, default=50, help='Arrival window: number of time steps at the end of the rollout over which the final position, heading and offset losses are averaged. Default is 50 (2 s at dt 0.04).')
 
     # optimizer
     parser.add_argument('--batch-size', type=int, default=100, help='Number of forward trajectories of the closed-loop system at each step (-1 = all training rollouts). Default is 100.')
@@ -86,9 +84,8 @@ def argument_parser():
 
 def print_args(args):
     msg = '\n[INFO] Dataset: n_agents: %i' % args.n_agents + ' -- num_rollouts: %i' % args.num_rollouts
-    msg += ' -- start radius: %g m -- start heading range: +-%g deg' % (args.start_radius, args.start_heading_range)
+    msg += ' -- families: %s' % ('all' if args.families is None else ', '.join(args.families))
     msg += ' -- time horizon: %i' % args.horizon
-    msg += ' -- goal heading range: +-%g deg' % args.goal_heading_range
 
     msg += '\n[INFO] Controller: dimension of the internal state: %i' % args.dim_internal
     msg += ' -- dim_nl: %i' % args.dim_nl + ' -- cont_init_std: %.2f'% args.cont_init_std

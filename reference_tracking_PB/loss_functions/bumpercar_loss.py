@@ -16,7 +16,6 @@ class BumpercarLoss(LQLossFH):
         alpha_heading=0.0, alpha_heading_final=0.0,
         heading_radius=0.5, goal_window_steps=50,
         alpha_offset_final=0.0,
-        goal_leg_ends=None, final_leg_start=0,
         alpha_bounds=0.0,
         alpha_smooth=0.0,
     ):
@@ -28,14 +27,11 @@ class BumpercarLoss(LQLossFH):
         self.position_deadzone = position_deadzone
         self.steady_state_velocity_radius = steady_state_velocity_radius
         self.alpha_heading, self.alpha_heading_final = alpha_heading, alpha_heading_final
-        # arrival window: steps at the end of every goal leg over which final position and heading are averaged
+        # arrival window: steps at the end of the rollout over which final position and heading are averaged
         self.heading_radius, self.goal_window_steps = heading_radius, goal_window_steps
         self.alpha_offset_final = alpha_offset_final
         # smoothness: squared change of the rPB offset dxref per step (jumps of the tracked reference), weight alpha_smooth
         self.alpha_smooth = alpha_smooth
-        # goal sequence: last step of each goal's leg (None: one goal, the end of the rollout) and the first step of the
-        # last goal's leg (the speed term only acts there: earlier goals may be passed at speed)
-        self.goal_leg_ends, self.final_leg_start = goal_leg_ends, final_leg_start
         self.alpha_col, self.alpha_obst, self.min_dist = alpha_col, alpha_obst, min_dist
         assert (self.alpha_col is None and self.min_dist is None) or not (self.alpha_col is None or self.min_dist is None)
         if self.alpha_col is not None:
@@ -104,20 +100,14 @@ class BumpercarLoss(LQLossFH):
             e_batch
         )   # shape = (S, T, 1, 1)
         loss_x = torch.sum(xTQx, 1) / e_batch.shape[1]   # average over the time horizon. shape = (S, 1, 1)
-        # final position: averaged over the arrival window (last goal_window_steps steps) of every goal's leg (the car has to be at
-        # the goal during that whole window, not only at its last step), summed over the goals
-        goal_leg_ends = self.goal_leg_ends if self.goal_leg_ends is not None else [e_batch.shape[1] - 1]
-        loss_x_final = 0
-        for end in goal_leg_ends:
-            e_window = e_batch[:, end - self.goal_window_steps + 1:end + 1]           # [S, K, nx, 1]
-            eTQe = torch.matmul(torch.matmul(e_window.transpose(-1, -2), self.Q_final), e_window)   # [S, K, 1, 1]
-            loss_x_final = loss_x_final + eTQe.mean(1)                                # (S, 1, 1)
+        # final position: averaged over the arrival window (last goal_window_steps steps of the rollout): the car has to
+        # be at the goal during that whole window, not only at its last step
+        e_window = e_batch[:, -self.goal_window_steps:]                               # [S, K, nx, 1]
+        eTQe = torch.matmul(torch.matmul(e_window.transpose(-1, -2), self.Q_final), e_window)   # [S, K, 1, 1]
+        loss_x_final = eTQe.mean(1)                                                   # (S, 1, 1)
 
         if self.steady_state_velocity_radius is not None:
             speed = speed * self.get_steady_state_velocity_mask(es)
-        # speed term only while the last goal is active (earlier goals may be passed at speed)
-        last_leg = (torch.arange(speed.shape[1], device=speed.device) >= self.final_leg_start).view(1, -1, 1, 1)
-        speed = speed * last_leg
 
         sTQs = torch.matmul(
             torch.matmul(speed.transpose(-1, -2), self.Qs),
@@ -135,11 +125,9 @@ class BumpercarLoss(LQLossFH):
         near_goal = torch.exp(-distance_to_goal**2 / (2 * self.heading_radius**2))   # 1 at the goal, 0.61 at r, 0.14 at 2r
         loss_heading = self.alpha_heading * (heading_cost * near_goal).sum((1, 2)) / es.shape[1]      # [S]
 
-        # terminal term: average over the arrival window of every goal's leg, summed over cars and goals
-        loss_heading_final = 0
-        for end in goal_leg_ends:
-            final_cost = heading_cost[:, end - self.goal_window_steps + 1:end + 1, :]   # [S, K, n_agents]
-            loss_heading_final = loss_heading_final + self.alpha_heading_final * final_cost.sum(-1).mean(-1)   # [S]
+        # terminal term: average over the arrival window at the end of the rollout, summed over cars
+        final_cost = heading_cost[:, -self.goal_window_steps:, :]                 # [S, K, n_agents]
+        loss_heading_final = self.alpha_heading_final * final_cost.sum(-1).mean(-1)   # [S]
 
         loss_heading = loss_heading.reshape(-1, 1, 1)
         loss_heading_final = loss_heading_final.reshape(-1, 1, 1)

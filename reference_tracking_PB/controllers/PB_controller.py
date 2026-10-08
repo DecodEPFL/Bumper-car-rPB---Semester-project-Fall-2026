@@ -48,8 +48,9 @@ class PerfBoostController(nn.Module):
             ren_internal_state_init (torch.Tensor, optional): initial state of the REN. Defaults to 0 when None.
             dt (float): time step [s] of the plant, for the reference trace.
             ref_trace_tau (float): time constant [s] of the reference trace per car: whenever the car's goal changes (and
-                at t = 0) it jumps by what is left to travel, new goal minus the car's current pose (x, y and heading as
-                sin, 1 - cos), and then decays from that value. 0 = only the pulse itself.
+                at t = 0) it restarts at what is left to travel, new goal minus the car's current pose (x, y and heading
+                as sin, 1 - cos), and then decays from that value. 0 = only the pulse itself. At a goal change the car's
+                REN state and GRU memory are reset too (per-car reset): every new reference starts like a training rollout.
             m2_type (str): M2 per car with shared weights, on the car's own w_in, goal and target heading plus its
                 current state (goal relative to the car, heading error, nearest other car): "gru" (SharedGRUGain, with
                 memory) or "mlp" (SharedMLPGain, without memory). Output bounded by m2_gain_bound.
@@ -167,14 +168,27 @@ class PerfBoostController(nn.Module):
 
         # 4) reference trace per car: when this car's goal changes (and at t = 0, from the zero initial reference), the
         #    way still to go: own new goal minus own pose (x, y and heading as sin, 1 - cos); 0 at all other steps.
-        #    trace_t = decay * trace_{t-1} + pulse_t: finitely many bounded pulses, stable filter -> l_p
+        #    At a goal change the trace restarts from the new pulse (see 4b), otherwise it decays:
+        #    trace_t = decay * trace_{t-1}: bounded pulses, stable filter -> l_p
         last_goal = self.last_xbar.view(-1, n, 2)
         last_target = self.last_theta_ref.view(-1, n)
         goal_changed = ((goal - last_goal).abs().sum(-1) + (1 - torch.cos(target - last_target))) > 0   # [B, n]
         to_turn = target - theta                                                          # [B, n]
         pulse = torch.cat((goal - position, torch.sin(to_turn).unsqueeze(-1), (1 - torch.cos(to_turn)).unsqueeze(-1)),
                           dim=-1) * goal_changed.unsqueeze(-1)                            # [B, n, 4]
-        self.ref_trace = pulse if self.ref_trace is None else self.ref_trace_decay * self.ref_trace + pulse
+        if self.ref_trace is None:
+            self.ref_trace = pulse
+        else:
+            self.ref_trace = torch.where(goal_changed.unsqueeze(-1), pulse, self.ref_trace_decay * self.ref_trace)
+
+        # 4b) per-car reset at a goal change (t > 0): the car starts over as at t = 0 of a training rollout (one
+        #     reference per rollout) -> its REN state and GRU memory back to their initial values, its trace = only the
+        #     new pulse (above); the other cars keep theirs. Never active in training (the goal only changes at t = 0)
+        if self.t > 0:
+            restart = goal_changed.view(B * n)                                           # rows: sample * n + car
+            self.c_ren.x = torch.where(restart.view(B * n, 1, 1), self.c_ren.init_x, self.c_ren.x)
+            if self.m2_hidden is not None:
+                self.m2_hidden = torch.where(restart.view(B * n, 1), torch.zeros_like(self.m2_hidden), self.m2_hidden)
 
         # 5) M1: the same REN for every car, own input, own state (rows: sample * n + car).
         #    theta* is not given to the REN: it does not vanish, so it would break l_p

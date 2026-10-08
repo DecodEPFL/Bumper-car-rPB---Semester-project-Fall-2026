@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(1, BASE_DIR)
 
-from experiment_params import getCarFinalParams, getCarInitParams, getLossParams, getExtraLossParams, getGoalSequence, getMissions, SCENARIOS, OBSTACLES
+from experiment_params import getCarInitParams, getFamilies, getLossParams, getExtraLossParams, SCENARIOS, OBSTACLES
 from controllers.MLP import ZeroController
 from config import device
 from arg_parser import argument_parser, print_args
@@ -60,26 +60,18 @@ def main():
     # [x, y, theta, vf, beta_f, beta_r, delta] for each car
     n_agents = args.n_agents
     nx = 7 * n_agents
-    x0_bumpercar,x_final_bumpercar, obstacle_centers, obstacle_covs, car_init_radius, start_heading_range = getCarInitParams(device)
-    x_final_limit, y_final_limit, final_car_min_dist = getCarFinalParams()
-    poses, missions = getMissions()
+    x0_bumpercar, x_final_bumpercar, obstacle_centers, obstacle_covs = getCarInitParams(device)
+    zones, families, sampling = getFamilies()
 
     dataset = BumpercarDataset(
         random_seed=args.random_seed,
         horizon=args.horizon,
-        x0=x0_bumpercar,
-        x_final=x_final_bumpercar,
-        car_init_radius=car_init_radius,
-        x_final_limit=x_final_limit,
-        y_final_limit=y_final_limit,
-        final_car_min_dist=final_car_min_dist,
-        start_heading_range=start_heading_range,
+        zones=zones,
+        families=families,                      # from SCENARIOS (--families): one family drawn per sample
+        sampling=sampling,
         n_agents=n_agents,
-        goal_heading_range=args.goal_heading_range * torch.pi / 180,
-        poses=poses,
-        missions=missions,                      # from SCENARIOS: one mission drawn per sample
     )
-    
+
 # divide to train and test
     train_data, test_data = dataset.get_data(num_train_samples=args.num_rollouts, num_test_samples=500)
     train_data, test_data = train_data.to(device), test_data.to(device)
@@ -88,12 +80,10 @@ def main():
 # data for plots
     t_ext = args.horizon * 4
 
-    # nominal scenario (first mission, no random offsets): nominal start, nominal goals switched per leg as in the dataset
+    # nominal scenario (crossing up, no sampling): nominal start, nominal goal over the whole horizon
     plot_data = torch.zeros(1, args.horizon, 2 * nx)
-    plot_data[:, 0, :nx] = dataset.x0.detach()
-    leg_ends = dataset.leg_starts[1:] + [args.horizon]
-    for goal, start, end in zip(getGoalSequence(), dataset.leg_starts, leg_ends):
-        plot_data[:, start:end, nx:] = goal.view(1, 1, -1)
+    plot_data[:, 0, :nx] = x0_bumpercar
+    plot_data[:, :, nx:] = x_final_bumpercar.view(1, 1, -1)
     plot_data = plot_data.to(device)
 
 # batch the data
@@ -167,8 +157,6 @@ def main():
         position_deadzone=position_deadzone,
         steady_state_velocity_radius=steady_state_velocity_radius,
         **getExtraLossParams(),
-        goal_leg_ends=dataset.goal_leg_ends,    # final position / heading at the end of every goal's leg
-        final_leg_start=dataset.final_leg_start,
     )
  
 # ------------ 5. Optimizer ------------
@@ -218,6 +206,7 @@ def main():
     t = time.time()
     for epoch in range(1 + args.epochs):
         max_grad_norm = 0.0   # largest gradient norm (before clipping) in this epoch
+        train_loss_sum, train_batches = 0.0, 0   # train loss of the epoch: mean over its batches
         # iterate over all data batches
         for train_data_batch in train_dataloader:
             optimizer.zero_grad()
@@ -232,10 +221,13 @@ def main():
             grad_norm = torch.nn.utils.clip_grad_norm_(ctl.parameters(), grad_clip)   # returns the norm before clipping
             max_grad_norm = max(max_grad_norm, grad_norm.item())
             optimizer.step()
+            train_loss_sum += loss.detach().item()
+            train_batches += 1
+        train_loss = train_loss_sum / train_batches
 
         # print info
         if epoch % args.log_epoch == 0:
-            msg = 'Epoch: %i --- train loss: %.2f' % (epoch, loss.detach().item())
+            msg = 'Epoch: %i --- train loss (mean over the epoch): %.2f' % (epoch, train_loss)
             msg += ' ---||--- lr: %.2e ---||--- max grad norm: %.3g' % (optimizer.param_groups[0]['lr'], max_grad_norm)
             loss_valid_value = None
             is_best = False
@@ -269,8 +261,8 @@ def main():
                 "Q": Q,
                 "Q_final": Q_final,
                 "args": vars(args),
-                "scenario": {**SCENARIOS[n_agents], "obstacles": OBSTACLES},   # starts, goals, obstacles of this run
-                "train_loss": loss.detach().item(),
+                "scenario": {**SCENARIOS[n_agents], "obstacles": OBSTACLES},   # zones, families, sampling, obstacles of this run
+                "train_loss": train_loss,
                 "validation_loss": loss_valid_value,
                 "best_valid_loss": best_valid_loss if args.return_best else None,
             }
@@ -287,7 +279,7 @@ def main():
 
             # loss curves so far (redrawn at every logged epoch, so a stopped run has them too)
             history["epoch"].append(epoch)
-            history["train"].append(loss.detach().item())
+            history["train"].append(train_loss)
             if loss_valid_value is not None:
                 history["valid"].append(loss_valid_value)
                 for name, value in valid_terms.items():
@@ -374,10 +366,10 @@ def plot_closed_loop(x, ref, save_folder, filename, text, loss_fn, T, x_baseline
 
 
 def plot_loss_curves(history, save_folder, filename):
-    """Loss over the logged epochs: totals (train = last batch of the epoch, validation) and every validation loss term."""
+    """Loss over the logged epochs: totals (train = mean over the epoch's batches, validation) and every validation loss term."""
     epochs = history["epoch"]
     fig, axs = plt.subplots(1, 2, figsize=(14, 5))
-    axs[0].plot(epochs, history["train"], label="train (last batch)", alpha=0.6)
+    axs[0].plot(epochs, history["train"], label="train (mean over the epoch's batches)", alpha=0.6)
     if history["valid"]:
         axs[0].plot(epochs, history["valid"], label="validation (train data)")
     axs[0].set_title("total loss")
